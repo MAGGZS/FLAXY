@@ -1,11 +1,6 @@
 // Cliente da API Rust. Mesma origem em produção; proxy do Vite em dev.
 
-// No app desktop o Tauri injeta o endereço do servidor embutido.
-declare global {
-  interface Window { __FLAXY_API__?: string }
-}
-export const IS_DESKTOP = typeof window !== "undefined" && !!window.__FLAXY_API__;
-const BASE = (window.__FLAXY_API__ ?? (import.meta.env.VITE_API_URL as string | undefined) ?? "").replace(/\/$/, "");
+const BASE = ((import.meta.env.VITE_API_URL as string | undefined) ?? "").replace(/\/$/, "");
 const KEY = import.meta.env.VITE_API_KEY as string | undefined;
 
 export const apiUrl = (path: string) => {

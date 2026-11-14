@@ -1,3 +1,0 @@
-Pasta do whisper-cli empacotado no instalador.
-Preenchida por toolsetch-whisper.ps1 (chamado pelo build-desktop.bat).
-Vazia: o app procura whisper-cli no PATH.

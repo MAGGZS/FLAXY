@@ -128,20 +128,27 @@ Referências de produto analisadas (páginas públicas, novembro de 2026):
   - Tipo: Geist + Geist Mono. Raios 8/12/16. Ícones lucide 16px, traço 1.5.
   - Proibido: brilho, gradiente de cor, emoji, rótulos em caixa alta espaçada.
 
+- 2026-11-13 — **Só navegador. App desktop removido.** Substitui as decisões
+  "Prioridade: app desktop `.exe`" e "Janela: Tauri". O dono pediu para tirar
+  tudo que exige instalar algo no PC além das dependências necessárias. Saíram
+  `crates/flaxy-desktop` (Tauri), `build-desktop.bat`, `start-desktop.bat`,
+  `tools/fetch-*.ps1` e `@tauri-apps/cli`. O FLAXY roda como `flaxy-server`,
+  que serve a API e o `web/dist` em http://127.0.0.1:8000. FFmpeg, yt-dlp e
+  whisper-cli ficam em `bin/` (fora do git) ou no PATH.
+
 ## Arquitetura
 
 ```
 FLAXY/
 ├── crates/
 │   ├── flaxy-core/      # domínio, FFmpeg, fila, SQLite, IA, yt-dlp
-│   ├── flaxy-server/    # Axum: HTTP + WebSocket, serve o frontend
-│   └── flaxy-desktop/   # Tauri v2: sobe o mesmo servidor em 127.0.0.1
-├── frontend/            # React + TS novo, igual para web e desktop
+│   └── flaxy-server/    # Axum: HTTP + WebSocket, serve o frontend
+├── web/                 # React + TS novo, aberto no navegador
+├── bin/                 # ffmpeg, yt-dlp, whisper-cli locais (opcional, fora do git)
 └── agente.md
 ```
 
-- O desktop roda o mesmo servidor Axum em porta local. Assim o frontend fala com
-  uma única API HTTP nos dois alvos, sem duas camadas de comunicação.
+- O frontend fala com uma única API HTTP, servida na mesma origem.
 - FFmpeg chamado via `tokio::process`. Progresso por `-progress pipe:1`, não por
   regex no stderr.
 - Encoder de GPU (NVENC/QSV/AMF) detectado uma vez na inicialização, não a cada
@@ -164,19 +171,11 @@ FLAXY/
 - [x] `web/`: React + TS do zero. Páginas Início, Lotes (com editor de recorte e
       trim), Biblioteca, Modelos (fundos), Configurações.
 - [x] Teste ponta a ponta: modelo + upload + lote com recorte e trim renderizado (AMF).
-- [x] `crates/flaxy-desktop` (Tauri v2): `FLAXY.exe` abre janela nativa, sobe o
-      servidor embutido em 127.0.0.1 (porta livre) e injeta `window.__FLAXY_API__`.
-      Interface embutida no `.exe`. Dados em `%APPDATA%\app.flaxy.desktop`.
-- [~] FFmpeg no instalador (decidido 2026-11-13: sim). Tauri empacota
-      `crates/flaxy-desktop/ffmpeg/` e o app usa ele antes do PATH.
-      `tools/fetch-ffmpeg.ps1` baixa o build gpl-shared do BtbN (chamado pelo
-      `build-desktop.bat`). Falta rodar o download uma vez (bloqueado pela
-      permissão do agente; o dono roda).
+- [-] App desktop Tauri (`FLAXY.exe`): removido em 2026-11-13 (só navegador).
 - [ ] Nuvem (futuro): Dockerfile Rust usando `flaxy-server`.
 - [ ] Remover/arquivar `backend/` e `frontend/` antigos (decisão do dono).
 
-Rodar app: `start-desktop.bat`. Gerar instalador: `build-desktop.bat`
-(saída em `target\release\bundle`). Modo servidor: `start-v2.bat` (porta 8000).
+Rodar: `start-v2.bat` (abre http://127.0.0.1:8000 no navegador).
 Dev do front: `cd web && npm run dev`.
 
 ### Fase 2: trim + áudio
@@ -190,8 +189,7 @@ Commits: só quando o dono mandar.
 
 ### Fase 3: legendas por IA (aba IA, Whisper local + APIs, modelos de legenda)
 Decisões (2026-11-13):
-- Whisper local: executável `whisper-cli` (whisper.cpp) empacotado como o FFmpeg,
-  em `crates/flaxy-desktop/whisper/`. Modelo baixado pelo app na primeira vez.
+- Whisper local: executável `whisper-cli` (whisper.cpp) em `bin/` ou no PATH. Modelo baixado pelo app na primeira vez.
 - Modelo padrão: `large-v3-turbo`.
 - APIs suportadas: Groq, OpenAI, Deepgram, AssemblyAI (chave na aba IA).
 - Estilos prontos: palavra destacada, palavra por palavra, clássica, caixa colorida.
@@ -209,7 +207,6 @@ Entregue:
       legenda no Lote, editor de texto da transcrição.
 - [x] Render dos 4 estilos testado com palavras digitadas (trim conferido).
 - [ ] Testar transcrição real (falta whisper-cli + modelo, ou uma chave de API).
-- [~] `tools/fetch-whisper.ps1` empacota o whisper-cli; falta o dono rodar.
 ### Fase 4: clipes de retenção (yt-dlp, transcrição, aprovação, layouts)
 Decisões (2026-11-13):
 - Duração: o usuário escolhe a faixa (15–30s, 30–60s, 60–90s, automático).
@@ -229,7 +226,6 @@ Entregue:
       prévia do trecho, editor de áreas de câmera/tela, legenda, download.
 - [x] Testado: download real pelo yt-dlp; render dos 3 layouts com legenda.
 - [ ] Testar análise real por LLM (falta chave/modelo configurado).
-- [~] `tools/fetch-ytdlp.ps1` empacota o yt-dlp; falta o dono rodar o build.
 
 ## Decisões pendentes
 

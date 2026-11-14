@@ -1,10 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, HashRouter, Navigate, Route, Routes } from "react-router-dom";
-import { IS_DESKTOP } from "./lib/api";
-
-// Arquivos locais do Tauri não reescrevem rotas para o index.html.
-const Router = IS_DESKTOP ? HashRouter : BrowserRouter;
+import { BrowserRouter as Router, Navigate, Route, Routes } from "react-router-dom";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import "./styles.css";

@@ -1,3 +1,0 @@
-Pasta do FFmpeg empacotado no instalador.
-Preenchida por toolsetch-ffmpeg.ps1 (chamado pelo build-desktop.bat).
-Vazia: o app usa o FFmpeg do PATH.

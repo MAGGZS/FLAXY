@@ -1,7 +1,6 @@
 //! Servidor HTTP do FLAXY como biblioteca.
 //!
-//! Usado de dois jeitos: pelo binário `flaxy-server` (nuvem / rede local) e
-//! embutido no app desktop, que sobe o servidor em 127.0.0.1 numa porta livre.
+//! Usado pelo binário `flaxy-server`, que serve a API e o frontend no navegador.
 
 mod ai_api;
 mod api;

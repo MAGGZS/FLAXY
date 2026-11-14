@@ -1,4 +1,4 @@
-//! Binário do servidor (nuvem / rede local). O app desktop usa a mesma biblioteca.
+//! Binário do servidor: API + frontend web, acessado pelo navegador.
 
 use std::net::SocketAddr;
 
