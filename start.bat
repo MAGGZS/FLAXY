@@ -12,11 +12,33 @@ set "FRONTEND_PORT=5173"
 :: encoders disputando a mesma CPU/GPU terminam mais devagar que em fila.
 if not defined FLAXY_MAX_CONCURRENT set "FLAXY_MAX_CONCURRENT=1"
 
+:: Python do ambiente virtual criado pelo install.bat. Sem ele, cai no Python
+:: global, que so funciona se as dependencias foram instaladas la.
+set "PY=%~dp0backend\.venv\Scripts\python.exe"
+if not exist "%PY%" (
+    python --version >nul 2>&1
+    if errorlevel 1 (
+        echo ERRO: Python nao encontrado. Rode install.bat primeiro.
+        pause & exit /b 1
+    )
+    set "PY=python"
+)
+
+if not exist "%~dp0frontend\node_modules" (
+    echo ERRO: dependencias do frontend ausentes. Rode install.bat primeiro.
+    pause & exit /b 1
+)
+
+:: settings.py le so variaveis de ambiente. --env-file faz o uvicorn carregar
+:: backend\.env antes de importar o app.
+set "ENV_FILE="
+if exist "%~dp0backend\.env" set "ENV_FILE=--env-file .env"
+
 :: Bind em 127.0.0.1 e nao em 0.0.0.0: a API nao tem autenticacao e aceita
 :: qualquer origem (CORS *), entao expo-la na rede local libera os seus arquivos
 :: para qualquer maquina do wi-fi. Para acessar de outro dispositivo de
 :: proposito, troque por 0.0.0.0 e ajuste VITE_API_URL no frontend.
-start "FLAXY Backend" cmd /k "cd /d %~dp0backend && python -m uvicorn main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload"
+start "FLAXY Backend" cmd /k "cd /d %~dp0backend && "%PY%" -m uvicorn main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload %ENV_FILE%"
 
 :: Espera o backend responder de verdade, em vez de chutar 3 segundos.
 :: /health so passa a existir depois que a aplicacao terminou de subir.

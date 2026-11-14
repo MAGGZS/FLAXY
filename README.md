@@ -37,6 +37,10 @@ install.bat
 start.bat
 ```
 
+`install.bat` cria um ambiente virtual em `backend/.venv` e copia
+`backend/.env.example` para `backend/.env`. `start.bat` usa esse Python e
+carrega esse `.env` sozinho.
+
 - Frontend: http://localhost:5173
 - Backend: http://localhost:8000
 - Docs da API: http://localhost:8000/docs

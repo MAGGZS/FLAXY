@@ -1,0 +1,26 @@
+[package]
+name = "flaxy-desktop"
+version.workspace = true
+edition.workspace = true
+description = "FLAXY: estação de produção de vídeo em massa"
+
+[[bin]]
+name = "FLAXY"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+flaxy-core = { path = "../flaxy-core" }
+flaxy-server = { path = "../flaxy-server" }
+tauri = { version = "2", features = [] }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Interface embutida no .exe. Sem ela o Tauri carrega o devUrl (Vite).
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

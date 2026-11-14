@@ -1,0 +1,7 @@
+/gen/
+/ffmpeg/*
+!/ffmpeg/LEIA.txt
+/whisper/*
+!/whisper/LEIA.txt
+/yt-dlp/*
+!/yt-dlp/LEIA.txt

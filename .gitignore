@@ -45,3 +45,9 @@ desktop.ini
 
 # Cache do Alembic
 backend/migrations/versions/__pycache__/
+
+# Rust
+/target/
+
+# Dados locais do servidor v2 (banco, fundos, modelos)
+/storage/

@@ -1,0 +1,3 @@
+Pasta do yt-dlp empacotado no instalador.
+Preenchida por toolsetch-ytdlp.ps1 (chamado pelo build-desktop.bat).
+Vazia: o app procura yt-dlp no PATH.
