@@ -176,7 +176,7 @@ impl Clips {
         let c = Self { db, cfg, render_slot: Arc::new(Semaphore::new(1)) };
         // Pipeline interrompido não tem como retomar no meio: marca erro.
         sqlx::query(
-            "UPDATE clip_projects SET status='error', error_msg='Interrompido ao fechar o app. Crie de novo.' \
+            "UPDATE clip_projects SET status='error', error_msg='Interrompido ao fechar o app. Tente de novo.' \
              WHERE status IN ('downloading','transcribing','analyzing')",
         )
         .execute(&c.db)
@@ -214,6 +214,27 @@ impl Clips {
         .bind(&layout)
         .fetch_one(&self.db)
         .await?;
+        self.run(id);
+        self.get(id).await
+    }
+
+    /// Roda de novo um projeto que falhou. Reaproveita o vídeo baixado e a
+    /// transcrição quando já existem.
+    pub async fn retry(&self, id: i64) -> Result<ProjectView> {
+        let p = self.get(id).await?.project;
+        if p.status != "error" {
+            return Err(Error::Invalid("Esse vídeo não falhou".into()));
+        }
+        sqlx::query("DELETE FROM clip_items WHERE project_id=?").bind(id).execute(&self.db).await?;
+        sqlx::query("UPDATE clip_projects SET status='downloading', progress=0, error_msg=NULL WHERE id=?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        self.run(id);
+        self.get(id).await
+    }
+
+    fn run(&self, id: i64) {
         let this = self.clone();
         tokio::spawn(async move {
             if let Err(e) = this.pipeline(id).await {
@@ -225,7 +246,6 @@ impl Clips {
                     .await;
             }
         });
-        self.get(id).await
     }
 
     pub async fn list(&self) -> Result<Vec<Project>> {
@@ -277,7 +297,10 @@ impl Clips {
         let p: Project = sqlx::query_as("SELECT * FROM clip_projects WHERE id=?").bind(id).fetch_one(&self.db).await?;
 
         // 1. Download (ou arquivo local escolhido pelo usuário)
-        let src = if Path::new(&p.url).is_file() {
+        let kept = p.source_path.as_deref().map(PathBuf::from).filter(|s| s.is_file());
+        let src = if let Some(s) = kept {
+            s
+        } else if Path::new(&p.url).is_file() {
             let title = Path::new(&p.url).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             sqlx::query("UPDATE clip_projects SET title=? WHERE id=?").bind(title).bind(id).execute(&self.db).await?;
             PathBuf::from(&p.url)
@@ -300,20 +323,20 @@ impl Clips {
         let settings = ai::load(&self.db).await?;
         let models = self.cfg.storage_dir.join("models");
         let ctx = TranscribeCtx { settings: &settings, models_dir: &models, work_dir: &self.cfg.work_dir };
-        let words = ai::transcribe(&ctx, &src).await?;
-        if words.is_empty() {
-            return Err(Error::Invalid("Nenhuma fala encontrada no vídeo".into()));
-        }
-        let (tid,): (i64,) = sqlx::query_as(
-            "INSERT INTO transcripts (source_path, provider, language, status, words) VALUES (?, ?, ?, 'done', ?) RETURNING id",
-        )
-        .bind(src.to_string_lossy().into_owned())
-        .bind(&settings.transcriber)
-        .bind(&settings.language)
-        .bind(serde_json::to_string(&words)?)
-        .fetch_one(&self.db)
-        .await?;
-        sqlx::query("UPDATE clip_projects SET transcript_id=? WHERE id=?").bind(tid).bind(id).execute(&self.db).await?;
+        let kept: Option<Vec<Word>> = match p.transcript_id {
+            Some(tid) => sqlx::query_as::<_, (String,)>("SELECT words FROM transcripts WHERE id=?")
+                .bind(tid)
+                .fetch_optional(&self.db)
+                .await?
+                .and_then(|(w,)| serde_json::from_str(&w).ok())
+                .filter(|w: &Vec<Word>| !w.is_empty()),
+            None => None,
+        };
+        let words = if let Some(w) = kept {
+            w
+        } else {
+            self.transcribe(id, &ctx, &src, &settings).await?
+        };
 
         // 3. Análise de retenção
         self.set_status(id, "analyzing", 0).await;
@@ -324,8 +347,7 @@ impl Clips {
         let (cam, scr) = suggest_rects(&p.layout, w, h);
         for s in suggestions {
             sqlx::query(
-                "INSERT INTO clip_items (project_id, start, end, score, title, reason, layout, camera_rect, screen_rect) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO clip_items (project_id, start, end, score, title, reason, layout, camera_rect, screen_rect)                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(s.start)
@@ -341,6 +363,24 @@ impl Clips {
         }
         self.set_status(id, "ready", 100).await;
         Ok(())
+    }
+
+    async fn transcribe(&self, id: i64, ctx: &TranscribeCtx<'_>, src: &Path, settings: &ai::AiSettings) -> Result<Vec<Word>> {
+        let words = ai::transcribe(ctx, src).await?;
+        if words.is_empty() {
+            return Err(Error::Invalid("Nenhuma fala encontrada no vídeo".into()));
+        }
+        let (tid,): (i64,) = sqlx::query_as(
+            "INSERT INTO transcripts (source_path, provider, language, status, words) VALUES (?, ?, ?, 'done', ?) RETURNING id",
+        )
+        .bind(src.to_string_lossy().into_owned())
+        .bind(&settings.transcriber)
+        .bind(&settings.language)
+        .bind(serde_json::to_string(&words)?)
+        .fetch_one(&self.db)
+        .await?;
+        sqlx::query("UPDATE clip_projects SET transcript_id=? WHERE id=?").bind(tid).bind(id).execute(&self.db).await?;
+        Ok(words)
     }
 
     async fn download(&self, id: i64, url: &str) -> Result<PathBuf> {

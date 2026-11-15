@@ -64,6 +64,7 @@ pub struct Clipes {
     t_create: Option<Task<Res<ProjectView>>>,
     t_render: Option<Task<Res<ProjectView>>>,
     t_delete: Option<Task<Res<()>>>,
+    t_retry: Option<Task<Res<ProjectView>>>,
     t_styles: Option<Task<Res<Vec<Style>>>>,
     last_poll: f64,
     confirm_delete: Option<Project>,
@@ -91,6 +92,7 @@ impl Default for Clipes {
             t_create: None,
             t_render: None,
             t_delete: None,
+            t_retry: None,
             t_styles: None,
             last_poll: 0.0,
             confirm_delete: None,
@@ -185,6 +187,18 @@ impl Clipes {
                     let n = v.clips.iter().filter(|c| c.row.status == "queued" || c.row.status == "processing").count();
                     sh.toasts.ok(format!("{n} clipes na fila"));
                     self.apply_view(v);
+                }
+                Err(e) => sh.toasts.err(e),
+            }
+        }
+        if let Some(r) = self.t_retry.as_ref().and_then(|t| t.take()) {
+            self.t_retry = None;
+            match r {
+                Ok(v) => {
+                    self.load_list(ui, sh);
+                    if self.sel == Some(v.project.id) {
+                        self.apply_view(v);
+                    }
                 }
                 Err(e) => sh.toasts.err(e),
             }
@@ -382,7 +396,7 @@ impl Clipes {
                     w::line(ui);
                 }
                 let on = self.sel == Some(p.id);
-                let resp = egui::Frame::NONE.fill(if on { RAISED } else { Color32::TRANSPARENT }).inner_margin(egui::Margin { left: 20, right: 8, top: 12, bottom: 12 }).show(ui, |ui| {
+                let resp = ui.scope_builder(egui::UiBuilder::new().id_salt(("clip-proj", p.id)).sense(Sense::click()), |ui| egui::Frame::NONE.fill(if on { RAISED } else { Color32::TRANSPARENT }).inner_margin(egui::Margin { left: 20, right: 8, top: 12, bottom: 12 }).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.set_width(ui.available_width());
                         ui.spacing_mut().item_spacing.x = 12.0;
@@ -419,8 +433,8 @@ impl Clipes {
                             }
                         });
                     });
-                });
-                if ui.interact(resp.response.rect, egui::Id::unique(("clip-proj", p.id)), Sense::click()).clicked() {
+                })).response;
+                if resp.clicked() && del.is_none() {
                     pick = Some(p.id);
                 }
             }
@@ -469,6 +483,18 @@ impl Clipes {
                             ui.add_space(12.0);
                             if p.status == "error" {
                                 ui.add(egui::Label::new(RichText::new(p.error_msg.clone().unwrap_or_default()).color(ERR)).wrap());
+                                ui.add_space(16.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let label = if self.t_retry.is_some() { "Tentando" } else { "Tentar de novo" };
+                                    if ui.add_enabled_ui(self.t_retry.is_none(), |ui| w::button(ui, Kind::Primary, Some(ic::ROTATE_CCW), label)).inner.clicked() {
+                                        let (bk, id) = (sh.bk.clone(), p.id);
+                                        self.t_retry = Some(sh.bk.spawn(ui.ctx(), async move { bk.clips.retry(id).await.map_err(backend::e) }));
+                                    }
+                                    if w::button(ui, Kind::Ghost, Some(ic::TRASH_2), "Apagar").clicked() {
+                                        self.confirm_delete = Some(p.clone());
+                                    }
+                                });
                                 return;
                             }
                             let order = ["downloading", "transcribing", "analyzing"];
