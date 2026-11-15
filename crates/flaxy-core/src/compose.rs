@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
 
 use crate::media::{self, Encoder};
 use crate::models::{ItemOverrides, Template};
@@ -286,7 +285,7 @@ where
     F: FnMut(i64) + Send,
 {
     let total = total.max(0.1);
-    let mut cmd = Command::new(ff);
+    let mut cmd = crate::media::command(ff);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

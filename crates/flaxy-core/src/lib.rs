@@ -1,6 +1,6 @@
 //! Núcleo do FLAXY: domínio, banco, FFmpeg e fila de renderização.
 //!
-//! Usado pelo servidor web (`flaxy-server`). Nada aqui conhece HTTP.
+//! Usado pelo app desktop (`flaxy-app`). Nada aqui conhece interface.
 
 pub mod ai;
 pub mod captions;

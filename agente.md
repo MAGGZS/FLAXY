@@ -136,19 +136,49 @@ Referências de produto analisadas (páginas públicas, novembro de 2026):
   que serve a API e o `web/dist` em http://127.0.0.1:8000. FFmpeg, yt-dlp e
   whisper-cli ficam em `bin/` (fora do git) ou no PATH.
 
+- 2026-11-14 — **App nativo `.exe` sem navegador (egui).** Substitui "Só
+  navegador" e reverte o descarte de "UI 100% Rust". O dono quer "um real
+  aplicativo" com tela de instalação, que abre sozinho ao instalar, e não quer
+  mais nada rodando em Edge/WebView. Confirmado pelo dono:
+  - Interface: **egui** (eframe + glow), desenhada pela GPU. Mesma paleta,
+    Geist/Geist Mono e ícones Lucide (fonte) da direção visual aprovada.
+  - Código web apagado: `web/` (React) e `crates/flaxy-server` (Axum). O app
+    chama o `flaxy-core` direto, sem HTTP. O v1 (`backend/`, `frontend/`) fica.
+  - Instalador: NSIS (`installer/flaxy.nsi`), por usuário, sem administrador,
+    atalhos no Menu Iniciar e na Área de Trabalho, "Abrir o FLAXY agora" no fim.
+  - Vídeos do lote são usados direto da pasta do usuário, sem cópia.
+  - Prévia de vídeo: o FFmpeg decodifica quadros RGBA direto para textura.
+    Prévia muda (sem áudio).
+
+- 2026-11-14 — **Passada /unslop no app nativo.** Rampa grafite dos tokens
+  (`#0f0f10` lateral, `#141415` fundo, `#19191b` cartão, `#232325` elevado,
+  linhas = texto a 8%/12%), botão principal off-white com texto escuro, acento
+  cobalto `#3b63d6` só em seleção de conteúdo, progresso, timeline e o número
+  que importa. Grade de 4px, navegação 32px com 2px entre linhas, ícones 16px
+  na cor do texto, keycaps nos atalhos, foco visível. Momentos: timeline com
+  quadros + forma de onda (editor), mapa de retenção com quadros + curva
+  (Clipes), prévia 9:16 do resultado com legenda (Lotes).
+- 2026-11-14 — **Capa do YouTube em Clipes** (pedido do dono): ao colar o link
+  aparecem capa, título e canal (i.ytimg.com + oEmbed); a lista de projetos e
+  cada sugestão mostram miniatura. Botão "Colar" lê a área de transferência.
+
 ## Arquitetura
 
 ```
 FLAXY/
 ├── crates/
 │   ├── flaxy-core/      # domínio, FFmpeg, fila, SQLite, IA, yt-dlp
-│   └── flaxy-server/    # Axum: HTTP + WebSocket, serve o frontend
-├── web/                 # React + TS novo, aberto no navegador
-├── bin/                 # ffmpeg, yt-dlp, whisper-cli locais (opcional, fora do git)
+│   └── flaxy-app/       # app nativo egui: telas, player, editores (FLAXY.exe)
+├── installer/           # NSIS: FLAXY-Setup-<versão>.exe
+├── tools/fetch-tools.ps1# baixa ffmpeg, yt-dlp e whisper-cli para bin/
+├── bin/                 # ferramentas empacotadas no instalador (fora do git)
 └── agente.md
 ```
 
-- O frontend fala com uma única API HTTP, servida na mesma origem.
+- A interface chama o núcleo em processo (runtime Tokio). Sem servidor HTTP.
+- Uma instância por vez (mutex nomeado): duas filas no mesmo banco renderizariam em dobro.
+- Dados em `%APPDATA%\FLAXY`, trabalho em `%LOCALAPPDATA%\FLAXY`, vídeos prontos
+  em `Vídeos\FLAXY` (configurável).
 - FFmpeg chamado via `tokio::process`. Progresso por `-progress pipe:1`, não por
   regex no stderr.
 - Encoder de GPU (NVENC/QSV/AMF) detectado uma vez na inicialização, não a cada
@@ -171,12 +201,16 @@ FLAXY/
 - [x] `web/`: React + TS do zero. Páginas Início, Lotes (com editor de recorte e
       trim), Biblioteca, Modelos (fundos), Configurações.
 - [x] Teste ponta a ponta: modelo + upload + lote com recorte e trim renderizado (AMF).
-- [-] App desktop Tauri (`FLAXY.exe`): removido em 2026-11-13 (só navegador).
-- [ ] Nuvem (futuro): Dockerfile Rust usando `flaxy-server`.
+- [-] App desktop Tauri (`FLAXY.exe`): removido em 2026-11-13.
+- [x] App nativo egui (`crates/flaxy-app`) com paridade das 7 páginas, editor de
+      recorte/trim com player, editor de câmera/tela, transcrição e prévia de
+      legenda. Instalador NSIS. Testado: lote com recorte + trim renderizado (AMF).
+- [-] `web/` e `crates/flaxy-server`: apagados em 2026-11-14.
+- [ ] Nuvem (futuro): exigiria um servidor novo sobre o `flaxy-core` (o antigo foi apagado).
 - [ ] Remover/arquivar `backend/` e `frontend/` antigos (decisão do dono).
 
-Rodar: `start-v2.bat` (abre http://127.0.0.1:8000 no navegador).
-Dev do front: `cd web && npm run dev`.
+Rodar em desenvolvimento: `run-app.bat`. Gerar instalador: `build-installer.bat`
+(saída em `target\release\FLAXY-Setup-<versão>.exe`). Ferramentas: `tools\fetch-tools.ps1`.
 
 ### Fase 2: trim + áudio
 - [x] Trim por vídeo (já entregue na fase 1).
@@ -189,7 +223,7 @@ Commits: só quando o dono mandar.
 
 ### Fase 3: legendas por IA (aba IA, Whisper local + APIs, modelos de legenda)
 Decisões (2026-11-13):
-- Whisper local: executável `whisper-cli` (whisper.cpp) em `bin/` ou no PATH. Modelo baixado pelo app na primeira vez.
+- Whisper local: executável `whisper-cli` (whisper.cpp) em `bin/whisper/`, `bin/` ou no PATH. Modelo baixado pelo app na primeira vez.
 - Modelo padrão: `large-v3-turbo`.
 - APIs suportadas: Groq, OpenAI, Deepgram, AssemblyAI (chave na aba IA).
 - Estilos prontos: palavra destacada, palavra por palavra, clássica, caixa colorida.
@@ -226,6 +260,16 @@ Entregue:
       prévia do trecho, editor de áreas de câmera/tela, legenda, download.
 - [x] Testado: download real pelo yt-dlp; render dos 3 layouts com legenda.
 - [ ] Testar análise real por LLM (falta chave/modelo configurado).
+
+## Prospecção (2026-11-14)
+
+- [x] Aba Prospecção: ranking dos vídeos mais vistos dos últimos 7 dias no
+      YouTube por tipo (em alta, shorts, podcasts, gameplays, notícias) e
+      notícias da semana do Google Notícias (RSS). Botão leva o vídeo para Clipes.
+- Fonte: yt-dlp com o filtro do YouTube "esta semana, por visualizações";
+  com chave da YouTube Data API (salva na tabela `settings`, chave `prospect`)
+  usa a API oficial. Resultados filtrados pelas palavras da busca.
+- Instagram fora: não tem busca pública sem login ou API aprovada da Meta.
 
 ## Decisões pendentes
 

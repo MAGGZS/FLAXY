@@ -52,5 +52,5 @@ backend/migrations/versions/__pycache__/
 # Dados locais do servidor v2 (banco, fundos, modelos)
 /storage/
 
-# Binarios locais (ffmpeg, yt-dlp, whisper-cli) usados pelo start-v2.bat
+# Ferramentas empacotadas no instalador (tools\fetch-tools.ps1)
 /bin/

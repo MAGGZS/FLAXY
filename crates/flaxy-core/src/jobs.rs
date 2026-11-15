@@ -84,22 +84,15 @@ impl Jobs {
             ));
         }
 
-        let uploads = crate::config::canonical(&cfg.uploads_dir())?;
+        // App local: os vídeos são usados direto da pasta do usuário, sem cópia.
         let mut entries = Vec::with_capacity(data.items.len());
         for item in &data.items {
             let p = crate::config::canonical(std::path::Path::new(&item.path))
                 .map_err(|_| Error::Invalid(format!("Arquivo não encontrado: {}", item.path)))?;
-            if !p.starts_with(&uploads) {
-                return Err(Error::Invalid("Caminho de vídeo fora da pasta de uploads".into()));
-            }
             let mut overrides = item.overrides.clone();
-            // A faixa extra também só pode vir da pasta de uploads.
             if let Some(ap) = overrides.audio_path.as_deref() {
                 let ap = crate::config::canonical(std::path::Path::new(ap))
                     .map_err(|_| Error::Invalid("Faixa de áudio não encontrada".into()))?;
-                if !ap.starts_with(&uploads) {
-                    return Err(Error::Invalid("Faixa de áudio fora da pasta de uploads".into()));
-                }
                 overrides.audio_path = Some(ap.to_string_lossy().into_owned());
             }
             let ov = if overrides.is_default() {

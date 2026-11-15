@@ -1,5 +1,52 @@
 # FLAXY
 
+Edição e geração de vídeos em massa com modelos, legendas automáticas e
+clipes de retenção.
+
+## FLAXY 2 (app nativo para Windows)
+
+O FLAXY 2 é um programa de verdade: instalador com tela de setup, ícone no
+Menu Iniciar e na Área de Trabalho, e janela própria. A interface é desenhada
+pela GPU com Rust (egui). Ele não usa navegador, WebView nem Edge.
+
+### Para quem usa
+
+1. Rode `FLAXY-Setup-<versão>.exe`.
+2. Avance as telas. No fim, deixe marcado "Abrir o FLAXY agora".
+
+O instalador não pede administrador e já traz o FFmpeg, o ffprobe, o yt-dlp e
+o whisper-cli. Nada mais precisa ser instalado.
+
+| O quê | Onde fica |
+|---|---|
+| Programa | `%LOCALAPPDATA%\Programs\FLAXY` |
+| Dados (banco, fundos, modelos do Whisper) | `%APPDATA%\FLAXY` |
+| Vídeos prontos | `Vídeos\FLAXY` (dá para trocar em Configurações) |
+
+Desinstalar (Configurações do Windows > Aplicativos) remove o programa e
+mantém os seus dados e vídeos.
+
+### Para quem desenvolve
+
+Precisa de Rust (`cargo`) e, só para gerar o instalador, do NSIS.
+
+| Comando | O que faz |
+|---|---|
+| `tools\fetch-tools.ps1` | Baixa ffmpeg, ffprobe, yt-dlp e whisper-cli para `bin\` (só o que falta) |
+| `run-app.bat` | Abre o app em modo de desenvolvimento |
+| `build-installer.bat` | Compila em release e gera `target\release\FLAXY-Setup-<versão>.exe` |
+
+| Pasta | O quê |
+|---|---|
+| `crates/flaxy-core` | Núcleo: banco SQLite, fila, FFmpeg, legendas, IA, clipes |
+| `crates/flaxy-app` | App nativo (egui): telas, player de vídeo, editores |
+| `installer/` | Script NSIS do instalador |
+| `bin/` | Ferramentas empacotadas (fora do git) |
+
+## FLAXY 1 (legado: FastAPI + React)
+
+O resto deste arquivo descreve a versão 1 em `backend/` e `frontend/`.
+
 Edição e geração de vídeos em massa com templates. FFmpeg + FastAPI + React.
 
 Você monta um **template** (fundo fixo + área onde o vídeo entra), joga até

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/flaxy-core", "crates/flaxy-server"]
+members = ["crates/flaxy-core", "crates/flaxy-app"]
 
 [workspace.package]
 version = "2.0.0"

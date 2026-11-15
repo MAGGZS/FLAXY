@@ -15,6 +15,15 @@ static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FFPROBE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static ENCODER: tokio::sync::OnceCell<Encoder> = tokio::sync::OnceCell::const_new();
 
+/// `Command` que não abre janela de console no Windows (app gráfico).
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    c
+}
+
 fn which(name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     if let Ok(dir) = std::env::var("FLAXY_FFMPEG_DIR") {
@@ -49,7 +58,7 @@ pub async fn encoder() -> &'static Encoder {
             ];
             if let Some(ff) = ffmpeg() {
                 for c in candidates {
-                    let ok = Command::new(ff)
+                    let ok = command(ff)
                         .args([
                             "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
                             "color=black:s=256x256:d=0.1", "-frames:v", "1", "-c:v", c.name,
@@ -83,7 +92,7 @@ pub struct Probe {
 /// Duração e presença de áudio numa única chamada ao ffprobe.
 pub async fn probe(path: &Path) -> Probe {
     let Some(fp) = ffprobe() else { return Probe::default() };
-    let out = Command::new(fp)
+    let out = command(fp)
         .args(["-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json"])
         .arg(path)
         .kill_on_drop(true)
@@ -105,7 +114,7 @@ pub async fn probe(path: &Path) -> Probe {
 /// Largura e altura do primeiro stream de vídeo (0,0 se não der para ler).
 pub async fn dimensions(path: &Path) -> (i64, i64) {
     let Some(fp) = ffprobe() else { return (0, 0) };
-    let Ok(out) = Command::new(fp)
+    let Ok(out) = command(fp)
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json"])
         .arg(path)
         .kill_on_drop(true)

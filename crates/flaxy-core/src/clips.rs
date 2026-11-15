@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::ai::{self, TranscribeCtx};
@@ -195,11 +194,12 @@ impl Clips {
     }
 
     pub async fn create(&self, p: NewProject) -> Result<ProjectView> {
-        let url = p.url.trim().to_string();
-        if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 2048 {
-            return Err(Error::Invalid("Cole um link http(s) válido".into()));
+        let url = p.url.trim().trim_matches('"').to_string();
+        let local = Path::new(&url).is_file();
+        if !local && (!(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 2048) {
+            return Err(Error::Invalid("Cole um link http(s) válido ou escolha um arquivo".into()));
         }
-        if ytdlp().is_none() {
+        if !local && ytdlp().is_none() {
             return Err(Error::Invalid("yt-dlp não encontrado. Reinstale o FLAXY".into()));
         }
         let min = p.min_len.clamp(5.0, 600.0);
@@ -255,8 +255,11 @@ impl Clips {
     pub async fn delete(&self, id: i64) -> Result<()> {
         let p = self.get(id).await?;
         sqlx::query("DELETE FROM clip_projects WHERE id=?").bind(id).execute(&self.db).await?;
+        // Só apaga o que o FLAXY baixou; arquivo local do usuário fica.
         if let Some(src) = p.project.source_path {
-            let _ = tokio::fs::remove_file(src).await;
+            if Path::new(&src).starts_with(self.cfg.uploads_dir()) {
+                let _ = tokio::fs::remove_file(src).await;
+            }
         }
         Ok(())
     }
@@ -273,8 +276,14 @@ impl Clips {
     async fn pipeline(&self, id: i64) -> Result<()> {
         let p: Project = sqlx::query_as("SELECT * FROM clip_projects WHERE id=?").bind(id).fetch_one(&self.db).await?;
 
-        // 1. Download
-        let src = self.download(id, &p.url).await?;
+        // 1. Download (ou arquivo local escolhido pelo usuário)
+        let src = if Path::new(&p.url).is_file() {
+            let title = Path::new(&p.url).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            sqlx::query("UPDATE clip_projects SET title=? WHERE id=?").bind(title).bind(id).execute(&self.db).await?;
+            PathBuf::from(&p.url)
+        } else {
+            self.download(id, &p.url).await?
+        };
         let probe = media::probe(&src).await;
         let (w, h) = media::dimensions(&src).await;
         sqlx::query("UPDATE clip_projects SET source_path=?, duration=?, width=?, height=? WHERE id=?")
@@ -338,7 +347,7 @@ impl Clips {
         let bin = ytdlp().ok_or_else(|| Error::Invalid("yt-dlp não encontrado".into()))?;
         let dir = self.cfg.uploads_dir();
         let template = dir.join(format!("clip_src_{id}.%(ext)s"));
-        let mut cmd = Command::new(bin);
+        let mut cmd = crate::media::command(bin);
         cmd.args([
             "--no-playlist", "--newline", "--encoding", "utf-8", "--no-part", "--no-mtime",
             "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",

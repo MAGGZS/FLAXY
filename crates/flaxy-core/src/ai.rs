@@ -8,7 +8,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tokio::process::Command;
 
 use crate::captions::Word;
 use crate::{media, Error, Result};
@@ -214,7 +213,7 @@ pub async fn download_model<F: FnMut(u8)>(models_dir: &Path, name: &str, mut on:
 /// Extrai o áudio em formato leve para transcrever.
 async fn extract_audio(input: &Path, out: &Path, wav: bool) -> Result<()> {
     let ff = media::ffmpeg().ok_or_else(|| Error::Ffmpeg("ffmpeg não encontrado".into()))?;
-    let mut cmd = Command::new(ff);
+    let mut cmd = crate::media::command(ff);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(input)
         .args(["-vn", "-ac", "1", "-ar", "16000"]);
@@ -293,7 +292,7 @@ async fn local_whisper(ctx: &TranscribeCtx<'_>, wav: &Path) -> Result<Vec<Word>>
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
     let lang = if ctx.settings.language.is_empty() { "auto" } else { &ctx.settings.language };
     // -ml 1 + -sow: um segmento por palavra, com tempo próprio.
-    let out = Command::new(cli)
+    let out = crate::media::command(cli)
         .arg("-m").arg(&model)
         .arg("-f").arg(wav)
         .args(["-l", lang, "-t", &threads.to_string(), "-ml", "1", "-sow", "-oj", "-np"])

@@ -64,14 +64,10 @@ impl Transcripts {
         self.cfg.storage_dir.join("models")
     }
 
-    /// Enfileira a transcrição de um arquivo da pasta de uploads.
+    /// Enfileira a transcrição de um arquivo local.
     pub async fn create(&self, path: &str) -> Result<Transcript> {
-        let uploads = crate::config::canonical(&self.cfg.uploads_dir())?;
         let p = crate::config::canonical(Path::new(path))
             .map_err(|_| Error::Invalid("Arquivo não encontrado".into()))?;
-        if !p.starts_with(&uploads) {
-            return Err(Error::Invalid("Arquivo fora da pasta de uploads".into()));
-        }
         let s = ai::load(&self.db).await?;
         let row: TranscriptRow = sqlx::query_as(
             "INSERT INTO transcripts (source_path, provider, language) VALUES (?, ?, ?) RETURNING *",

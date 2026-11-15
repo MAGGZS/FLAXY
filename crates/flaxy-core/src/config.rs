@@ -17,6 +17,8 @@ pub struct Config {
     pub max_upload_mb: u64,
     pub api_key: Option<String>,
     pub cors_origins: Vec<String>,
+    /// Pasta dos vídeos prontos. `None` = `work_dir/output`.
+    pub output_override: Option<PathBuf>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -51,7 +53,21 @@ impl Config {
             cors_origins: env("CORS_ORIGINS")
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
                 .unwrap_or_default(),
+            output_override: env("FLAXY_OUTPUT_DIR").map(PathBuf::from),
         }
+    }
+
+    /// Pastas do app desktop: dados em %APPDATA%\FLAXY, trabalho em
+    /// %LOCALAPPDATA%\FLAXY e vídeos prontos em Vídeos\FLAXY.
+    pub fn desktop() -> Self {
+        let home = |k: &str| env(k).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let mut c = Self::from_env();
+        c.storage_dir = env("FLAXY_STORAGE_DIR").map(PathBuf::from).unwrap_or_else(|| home("APPDATA").join("FLAXY"));
+        c.work_dir = env("FLAXY_WORK_DIR").map(PathBuf::from).unwrap_or_else(|| home("LOCALAPPDATA").join("FLAXY"));
+        if c.output_override.is_none() {
+            c.output_override = Some(home("USERPROFILE").join("Videos").join("FLAXY"));
+        }
+        c
     }
 
     pub fn templates_dir(&self) -> PathBuf {
@@ -61,7 +77,7 @@ impl Config {
         self.work_dir.join("uploads")
     }
     pub fn output_dir(&self) -> PathBuf {
-        self.work_dir.join("output")
+        self.output_override.clone().unwrap_or_else(|| self.work_dir.join("output"))
     }
     pub fn logs_dir(&self) -> PathBuf {
         self.work_dir.join("logs")
