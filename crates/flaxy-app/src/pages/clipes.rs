@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
-use flaxy_core::captions::Style;
+use flaxy_core::captions::{CaptionStyle, Style, Word};
 use flaxy_core::clips::{suggest_rects, ClipEdit, NewProject, Project, ProjectView, Rect as FRect, RenderRequest};
 use flaxy_core::templates::ALLOWED_VIDEO;
 
 use crate::app::{Page, Shared};
 use crate::backend::{self, Res, Task};
+use crate::editors::caption_preview;
 use crate::editors::rect_editor::{self, RectEditor};
 use crate::format::{date_time, timecode};
 use crate::icons as ic;
@@ -68,6 +69,13 @@ pub struct Clipes {
     t_styles: Option<Task<Res<Vec<Style>>>>,
     last_poll: f64,
     confirm_delete: Option<Project>,
+    /// Trecho mostrado na prévia 9:16.
+    focus: Option<i64>,
+    volume: f32,
+    muted: bool,
+    /// Palavras da transcrição do projeto aberto (id da transcrição, palavras).
+    words: Option<(i64, Vec<Word>)>,
+    t_words: Option<Task<Res<(i64, Vec<Word>)>>>,
 }
 
 impl Default for Clipes {
@@ -96,6 +104,11 @@ impl Default for Clipes {
             t_styles: None,
             last_poll: 0.0,
             confirm_delete: None,
+            focus: None,
+            volume: 0.8,
+            muted: false,
+            words: None,
+            t_words: None,
         }
     }
 }
@@ -118,6 +131,7 @@ impl Clipes {
             self.drafts.clear();
             self.player = None;
             self.playing_clip = None;
+            self.focus = None;
             self.load_view(ui, sh, id);
         }
     }
@@ -133,7 +147,7 @@ impl Clipes {
         }
         if self.player.is_none() {
             if let Some(src) = v.project.source_path.as_deref().filter(|_| v.project.status == "ready") {
-                self.player = Some(Player::new(src, 0.5, (960, 540)));
+                self.player = Some(Player::new(src, 0.5, (960, 540)).with_audio());
             }
         }
         self.view = Some(v);
@@ -189,6 +203,12 @@ impl Clipes {
                     self.apply_view(v);
                 }
                 Err(e) => sh.toasts.err(e),
+            }
+        }
+        if let Some(r) = self.t_words.as_ref().and_then(|t| t.take()) {
+            self.t_words = None;
+            if let Ok(w) = r {
+                self.words = Some(w);
             }
         }
         if let Some(r) = self.t_retry.as_ref().and_then(|t| t.take()) {
@@ -247,6 +267,7 @@ impl Clipes {
         }
         self.poll(ui, sh);
         if let Some(p) = self.player.as_mut() {
+            p.set_volume(if self.muted { 0.0 } else { self.volume });
             p.update(ui.ctx());
             if !p.is_playing() {
                 self.playing_clip = None;
@@ -530,14 +551,99 @@ impl Clipes {
         let mut seek_clip: Option<(i64, f64, f64)> = None;
         w::card(ui, &p.title, &meta, |_| {}, |ui| {
             w::pad(ui, |ui| {
-                let (outer, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 360.0), Sense::hover());
-                ui.painter().rect_filled(outer, CornerRadius::same(R), Color32::BLACK);
-                if let Some(pl) = &self.player {
-                    let img = fit_rect(outer, pl.aspect());
-                    if let Some(t) = pl.texture() {
-                        ui.painter().image(t.id(), img, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                if let Some(tid) = p.transcript_id {
+                    if self.words.as_ref().map(|w| w.0) != Some(tid) && self.t_words.is_none() {
+                        let bk = sh.bk.clone();
+                        self.t_words = Some(sh.bk.spawn(ui.ctx(), async move {
+                            let (w,): (String,) = sqlx::query_as("SELECT words FROM transcripts WHERE id=?").bind(tid).fetch_one(&bk.db).await.map_err(backend::e)?;
+                            Ok((tid, serde_json::from_str(&w).map_err(backend::e)?))
+                        }));
                     }
-                    ui.painter().text(outer.left_bottom() + egui::vec2(12.0, -12.0), Align2::LEFT_BOTTOM, timecode(pl.pos, true), mono(T_META), TEXT_2);
+                }
+                let mut toggle = ui.input(|i| i.key_pressed(egui::Key::Space)) && !ui.ctx().egui_wants_keyboard_input() && self.marking.is_none() && self.confirm_delete.is_none();
+                const VID_H: f32 = 384.0;
+                const PREV_W: f32 = 216.0;
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 16.0;
+                    let left_w = (ui.available_width() - PREV_W - 16.0).max(240.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(left_w);
+                        let (outer, vr) = ui.allocate_exact_size(egui::vec2(left_w, VID_H), Sense::click());
+                        ui.painter().rect_filled(outer, CornerRadius::same(R), Color32::BLACK);
+                        if let Some(t) = self.player.as_ref().and_then(|pl| pl.texture().map(|t| (t, pl.aspect()))) {
+                            ui.painter_at(outer).image(t.0.id(), fit_rect(outer, t.1), Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        if vr.clicked() {
+                            toggle = true;
+                        }
+                        ui.add_space(8.0);
+                        // Controles: reproduzir/pausar, tempo, volume.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (playing, pos) = self.player.as_ref().map(|pl| (pl.is_playing(), pl.pos)).unwrap_or((false, 0.0));
+                            if w::icon_button(ui, if playing { ic::PAUSE } else { ic::PLAY }, if playing { "Pausar (espaço)" } else { "Reproduzir (espaço)" }).clicked() {
+                                toggle = true;
+                            }
+                            ui.label(w::mono_text(format!("{} / {}", timecode(pos, true), timecode(p.duration, true)), T_META, TEXT_2));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if volume_bar(ui, &mut self.volume, self.muted) && self.volume > 0.0 {
+                                    self.muted = false;
+                                }
+                                let off = self.muted || self.volume <= 0.0;
+                                let icon = if off { ic::VOLUME_X } else if self.volume < 0.5 { ic::VOLUME_1 } else { ic::VOLUME_2 };
+                                if w::icon_button(ui, icon, if off { "Ligar som" } else { "Sem som" }).clicked() {
+                                    if self.volume <= 0.0 {
+                                        self.volume = 0.8;
+                                        self.muted = false;
+                                    } else {
+                                        self.muted = !self.muted;
+                                    }
+                                }
+                            });
+                        });
+                    });
+                    // Prévia do clipe como vai sair, com a legenda escolhida.
+                    ui.vertical(|ui| {
+                        ui.set_width(PREV_W);
+                        let (slot, _) = ui.allocate_exact_size(egui::vec2(PREV_W, VID_H), Sense::hover());
+                        let focus = self.focus.and_then(|id| v.clips.iter().find(|c| c.row.id == id)).or(v.clips.first());
+                        let (layout, cam, scr) = match focus.and_then(|c| self.drafts.get(&c.row.id)) {
+                            Some(d) => (d.layout.clone(), d.camera, d.screen),
+                            None => {
+                                let (c, s) = suggest_rects(&p.layout, p.width, p.height);
+                                (p.layout.clone(), c, s)
+                            }
+                        };
+                        let style = self.style_id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| &s.style);
+                        let words = self.words.as_ref().filter(|w| Some(w.0) == p.transcript_id).map(|w| w.1.as_slice()).unwrap_or(&[]);
+                        let tex = self.player.as_ref().and_then(|pl| pl.texture().map(|t| (t, pl.aspect())));
+                        let pos = self.player.as_ref().map(|pl| pl.pos).unwrap_or(0.0);
+                        clip_preview(ui, slot, tex, &layout, cam, scr, style, &sh.caption_fonts, words, pos);
+                        ui.add_space(8.0);
+                        let cur = self.style_id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| s.row.name.clone()).unwrap_or_else(|| "Sem legenda".into());
+                        egui::ComboBox::from_id_salt("clip-style").width(PREV_W).selected_text(format!("{}  {cur}", ic::CAPTIONS)).show_ui(ui, |ui| {
+                            if ui.selectable_label(self.style_id.is_none(), "Sem legenda").clicked() {
+                                self.style_id = None;
+                            }
+                            for s in &self.styles {
+                                if ui.selectable_label(self.style_id == Some(s.row.id), &s.row.name).clicked() {
+                                    self.style_id = Some(s.row.id);
+                                }
+                            }
+                        });
+                    });
+                });
+                if toggle {
+                    if let Some(pl) = self.player.as_mut() {
+                        if pl.is_playing() {
+                            pl.pause();
+                        } else {
+                            if pl.stop_at.is_some_and(|e| pl.pos >= e - 0.1) {
+                                pl.stop_at = None;
+                            }
+                            pl.play();
+                        }
+                    }
                 }
                 ui.add_space(12.0);
                 // Mapa de retenção (momento da direção): régua, quadros do vídeo,
@@ -730,18 +836,8 @@ impl Clipes {
             w::line(ui);
             w::pad(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(w::dim("Legenda"));
-                    let cur = self.style_id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| s.row.name.clone()).unwrap_or_else(|| "Sem legenda".into());
-                    egui::ComboBox::from_id_salt("clip-style").width(220.0).selected_text(cur).show_ui(ui, |ui| {
-                        if ui.selectable_label(self.style_id.is_none(), "Sem legenda").clicked() {
-                            self.style_id = None;
-                        }
-                        for s in &self.styles {
-                            if ui.selectable_label(self.style_id == Some(s.row.id), &s.row.name).clicked() {
-                                self.style_id = Some(s.row.id);
-                            }
-                        }
-                    });
+                    let cur = self.style_id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| s.row.name.clone()).unwrap_or_else(|| "sem legenda".into());
+                    ui.label(w::muted(format!("Legenda: {cur}")));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled_ui(approved > 0 && self.t_render.is_none(), |ui| {
                             let label = format!("Cortar {approved} {}", if approved == 1 { "clipe" } else { "clipes" });
@@ -767,6 +863,7 @@ impl Clipes {
         });
 
         if let Some((id, a, b)) = seek_clip {
+            self.focus = Some(id);
             if let Some(pl) = self.player.as_mut() {
                 pl.seek(a);
                 pl.stop_at = Some(b);
@@ -831,4 +928,70 @@ impl Clipes {
             }
         }
     }
+}
+
+/// Desenha o clipe como ele sai do corte: recorte da câmera (e da tela) no
+/// quadro 9:16, ou o vídeo inteiro no horizontal, com a legenda por cima.
+#[allow(clippy::too_many_arguments)]
+fn clip_preview(ui: &Ui, slot: Rect, tex: Option<(&egui::TextureHandle, f32)>, layout: &str, cam: FRect, scr: FRect, style: Option<&CaptionStyle>, fonts: &[String], words: &[Word], t: f64) {
+    let out = if layout == "horizontal" { Rect::from_center_size(slot.center(), egui::vec2(slot.width(), slot.width() * 9.0 / 16.0)) } else { slot };
+    ui.painter().rect_filled(slot, CornerRadius::same(R), BG_DEEP);
+    ui.painter().rect_filled(out, CornerRadius::same(R), Color32::BLACK);
+    let pt = ui.painter_at(out);
+    if let Some((tex, aspect)) = tex {
+        // Recorte `r` (fração do quadro) preenchendo `dst`, como o crop + scale do FFmpeg.
+        let cover = |dst: Rect, r: FRect| {
+            let a = (r.w as f32 * aspect) / (r.h as f32).max(0.001);
+            let ta = dst.width() / dst.height();
+            let (mut x, mut y, mut w, mut h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+            if a > ta {
+                let nw = w * ta / a;
+                x += (w - nw) / 2.0;
+                w = nw;
+            } else {
+                let nh = h * a / ta;
+                y += (h - nh) / 2.0;
+                h = nh;
+            }
+            pt.image(tex.id(), dst, Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), Color32::WHITE);
+        };
+        match layout {
+            "horizontal" => {
+                pt.image(tex.id(), fit_rect(out, aspect), Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            "vertical_split" => {
+                let split = out.top() + out.height() * 0.6;
+                cover(Rect::from_min_max(out.min, egui::pos2(out.right(), split)), scr);
+                cover(Rect::from_min_max(egui::pos2(out.left(), split), out.max), cam);
+            }
+            _ => cover(out, cam),
+        }
+    }
+    if let Some(st) = style {
+        caption_preview::paint_at(&pt, out, st, fonts, words, t);
+    }
+    ui.painter().rect_stroke(slot, CornerRadius::same(R), Stroke::new(1.0, LINE), StrokeKind::Inside);
+}
+
+/// Volume: trilho fino, preenchido até o nível, arrastável. Devolve true se mudou.
+fn volume_bar(ui: &mut Ui, v: &mut f32, muted: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(96.0, 20.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 8.0, 4.0));
+    let mut changed = false;
+    if let Some(pp) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+        let nv = ((pp.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        changed = (nv - *v).abs() > f32::EPSILON;
+        *v = nv;
+    }
+    let level = if muted { 0.0 } else { *v };
+    let p = ui.painter();
+    p.rect_filled(track, CornerRadius::same(2), RAISED_2);
+    let x = track.left() + track.width() * level;
+    p.rect_filled(Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), CornerRadius::same(2), if resp.hovered() || resp.dragged() { TEXT } else { TEXT_2 });
+    p.circle_filled(egui::pos2(x, track.center().y), if resp.hovered() || resp.dragged() { 6.0 } else { 5.0 }, TEXT);
+    let resp = resp.on_hover_text(format!("Volume {}%", (level * 100.0).round()));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    changed
 }

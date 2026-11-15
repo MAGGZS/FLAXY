@@ -2,7 +2,7 @@
 //! Aproximação fiel o bastante para escolher o estilo; o render usa libass.
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Rect, Sense, Ui};
-use flaxy_core::captions::{CaptionStyle, Kind};
+use flaxy_core::captions::{CaptionStyle, Kind, Word};
 
 use crate::theme::*;
 
@@ -30,8 +30,6 @@ pub fn preview(ui: &mut Ui, st: &CaptionStyle, height: f32, fonts: &[String]) {
 
 /// Desenha a legenda animada dentro de `rect` (o quadro de saída inteiro).
 pub fn paint(p: &egui::Painter, rect: Rect, st: &CaptionStyle, fonts: &[String], t: f64) {
-    let height = rect.height();
-    let width = rect.width();
     let tick = (t / 0.42) as usize;
     let per = match st.kind {
         Kind::Word => 1,
@@ -45,14 +43,40 @@ pub fn paint(p: &egui::Painter, rect: Rect, st: &CaptionStyle, fonts: &[String],
         .map(|w| if st.uppercase { w.to_uppercase() } else { w.to_string() })
         .collect();
     let active = idx - start;
+    paint_words(p, rect, st, fonts, &chunk, active, (t / 0.42).fract() as f32);
+}
 
+/// Legenda real: as palavras da transcrição no instante `t` do vídeo.
+pub fn paint_at(p: &egui::Painter, rect: Rect, st: &CaptionStyle, fonts: &[String], words: &[Word], t: f64) {
+    let Some(i) = words.iter().rposition(|w| w.start <= t) else { return };
+    // Pausa longa depois da fala: some a legenda.
+    if t > words[i].end + 0.8 {
+        return;
+    }
+    let per = match st.kind {
+        Kind::Word => 1,
+        Kind::Classic => st.max_words.clamp(1, 8),
+        _ => st.max_words.max(1),
+    };
+    let start = i / per * per;
+    let chunk: Vec<String> = words[start..(start + per).min(words.len())]
+        .iter()
+        .map(|w| if st.uppercase { w.text.trim().to_uppercase() } else { w.text.trim().to_string() })
+        .collect();
+    let w = &words[i];
+    let phase = ((t - w.start) / (w.end - w.start).max(0.05)).clamp(0.0, 1.0) as f32;
+    paint_words(p, rect, st, fonts, &chunk, i - start, phase);
+}
+
+fn paint_words(p: &egui::Painter, rect: Rect, st: &CaptionStyle, fonts: &[String], chunk: &[String], active: usize, phase: f32) {
+    let height = rect.height();
+    let width = rect.width();
     let scale = height / 1920.0;
     let family = if fonts.iter().any(|f| f == &st.font) { caption_family(&st.font, st.bold) } else { if st.bold { medium() } else { egui::FontFamily::Proportional } };
     let mut size = (st.size as f32 * scale).max(6.0);
     if st.kind == Kind::Word {
         // "pop": cresce um pouco no começo de cada palavra.
-        let phase = ((t / 0.42).fract() as f32 * 3.0).min(1.0);
-        size *= 0.85 + 0.15 * phase;
+        size *= 0.85 + 0.15 * (phase * 3.0).min(1.0);
     }
     let font = FontId::new(size, family);
     let space = p.layout_no_wrap(" ".into(), font.clone(), Color32::WHITE).size().x;

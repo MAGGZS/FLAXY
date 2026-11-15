@@ -46,3 +46,6 @@ pub const EYE: &str = "\u{e0ba}";
 pub const NEWSPAPER: &str = "\u{e348}";
 pub const TELESCOPE: &str = "\u{e5c5}";
 pub const ARROW_UP_RIGHT: &str = "\u{e04d}";
+pub const VOLUME_1: &str = "\u{e1aa}";
+pub const VOLUME_2: &str = "\u{e1ab}";
+pub const VOLUME_X: &str = "\u{e1ac}";

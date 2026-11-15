@@ -2,8 +2,8 @@
 //! direto para RGBA e eles viram textura na GPU.
 //!
 //! - `Thumbs`: miniaturas em cache (um quadro por arquivo/tempo/tamanho).
-//! - `Player`: prévia com reprodução, pausa e busca. Mudo de propósito: é
-//!   para enquadrar e cortar, não para assistir.
+//! - `Player`: prévia com reprodução, pausa e busca. Mudo por padrão (é para
+//!   enquadrar e cortar); `with_audio` liga o som com volume.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -168,16 +168,77 @@ struct Session {
     from: f64,
     started: Option<Instant>,
     pending: Option<Frame>,
+    audio: Option<Audio>,
+}
+
+const RATE: u32 = 48_000;
+
+/// Som do trecho: um FFmpeg decodifica para f32 estéreo e o rodio toca.
+struct Audio {
+    _out: rodio::OutputStream,
+    sink: rodio::Sink,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl Drop for Audio {
+    fn drop(&mut self) {
+        self.sink.stop();
+        kill(&self.child);
+    }
+}
+
+fn kill(child: &Arc<Mutex<Option<Child>>>) {
+    if let Ok(mut c) = child.lock() {
+        if let Some(mut ch) = c.take() {
+            let _ = ch.kill();
+            let _ = ch.wait();
+        }
+    }
+}
+
+/// Amostras vindas do FFmpeg. Sem dados ainda, toca silêncio em quadros
+/// estéreo inteiros para não trocar os canais.
+struct Pcm {
+    rx: Receiver<Vec<f32>>,
+    buf: Vec<f32>,
+    i: usize,
+}
+
+impl Iterator for Pcm {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.i >= self.buf.len() {
+            self.buf = match self.rx.try_recv() {
+                Ok(b) => b,
+                Err(TryRecvError::Empty) => vec![0.0; 64],
+                Err(TryRecvError::Disconnected) => return None,
+            };
+            self.i = 0;
+        }
+        let v = self.buf.get(self.i).copied();
+        self.i += 1;
+        v
+    }
+}
+
+impl rodio::Source for Pcm {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        2
+    }
+    fn sample_rate(&self) -> u32 {
+        RATE
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Ok(mut c) = self.child.lock() {
-            if let Some(mut ch) = c.take() {
-                let _ = ch.kill();
-                let _ = ch.wait();
-            }
-        }
+        kill(&self.child);
     }
 }
 
@@ -199,6 +260,8 @@ pub struct Player {
     seek_rx: Option<Receiver<Option<Frame>>>,
     seek_want: Option<f64>,
     failed: bool,
+    audio_on: bool,
+    volume: f32,
 }
 
 impl Player {
@@ -223,6 +286,22 @@ impl Player {
             seek_rx: None,
             seek_want: Some(at.max(0.0)),
             failed: false,
+            audio_on: false,
+            volume: 1.0,
+        }
+    }
+
+    /// Toca o som junto com o vídeo.
+    pub fn with_audio(mut self) -> Self {
+        self.audio_on = true;
+        self
+    }
+
+    /// Volume de 0 a 1; vale na hora, mesmo tocando.
+    pub fn set_volume(&mut self, v: f32) {
+        self.volume = v.clamp(0.0, 1.0);
+        if let Some(a) = self.session.as_ref().and_then(|s| s.audio.as_ref()) {
+            a.sink.set_volume(self.volume);
         }
     }
 
@@ -434,7 +513,50 @@ impl Player {
                 n += 1;
             }
         });
-        Some(Session { rx, child, from, started: None, pending: None })
+        let audio = if self.audio_on { self.spawn_audio(from, len) } else { None };
+        Some(Session { rx, child, from, started: None, pending: None, audio })
+    }
+
+    fn spawn_audio(&self, from: f64, len: f64) -> Option<Audio> {
+        let (out, handle) = rodio::OutputStream::try_default().ok()?;
+        let sink = rodio::Sink::try_new(&handle).ok()?;
+        let mut c = self.base_cmd(from)?;
+        let mut child = c
+            .args(["-t", &format!("{len:.3}"), "-vn", "-ac", "2", "-ar", &RATE.to_string(), "-f", "f32le", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let child = Arc::new(Mutex::new(Some(child)));
+        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(16);
+        std::thread::spawn(move || {
+            // 4096 quadros estéreo por bloco; só blocos inteiros.
+            let mut raw = vec![0u8; 4096 * 2 * 4];
+            loop {
+                let mut got = 0;
+                while got < raw.len() {
+                    match stdout.read(&mut raw[got..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                let whole = got / 8 * 8;
+                if whole > 0 {
+                    let b: Vec<f32> = raw[..whole].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    if tx.send(b).is_err() {
+                        break;
+                    }
+                }
+                if got < raw.len() {
+                    break;
+                }
+            }
+        });
+        sink.set_volume(self.volume);
+        sink.append(Pcm { rx, buf: Vec::new(), i: 0 });
+        Some(Audio { _out: out, sink, child })
     }
 }
 
