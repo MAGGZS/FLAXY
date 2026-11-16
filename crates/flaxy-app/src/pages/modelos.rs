@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, RichText, Sense, Stroke, StrokeKind, Ui};
 use flaxy_core::captions::{CaptionStyle, Kind as CapKind, Style};
-use flaxy_core::models::{Template, TemplateInput};
+use flaxy_core::models::{ClipBackground, Template, TemplateInput};
 use flaxy_core::templates::{self as tpls, ALLOWED_BG};
 
 use crate::app::Shared;
 use crate::backend::{self, Res, Task};
 use crate::editors::caption_preview::{self, hex, to_hex};
+use crate::editors::watermark_editor::WatermarkTab;
 use crate::format::ratio_label;
 use crate::icons as ic;
 use crate::media;
@@ -22,6 +23,10 @@ const PRESETS: [(&str, i64, i64); 4] = [("9:16", 1080, 1920), ("4:5", 1080, 1350
 enum Tab {
     #[default]
     Fundos,
+    /// Fundos personalizados para a sobra das áreas em Encaixar nos clipes.
+    ClipBgs,
+    /// Textos translúcidos por cima dos clipes.
+    Marcas,
     Legendas,
 }
 
@@ -60,12 +65,24 @@ pub struct Modelos {
     style_dirty: bool,
     t_styles: Option<Task<Res<(Vec<Style>, Option<i64>)>>>,
     confirm_style: bool,
+    // fundos de clipe
+    clip_bgs: Vec<ClipBackground>,
+    t_bgs: Option<Task<Res<Vec<ClipBackground>>>>,
+    confirm_bg: Option<ClipBackground>,
+    /// Fundo com o nome em edição (id, texto).
+    rename_bg: Option<(i64, String)>,
+    marcas: WatermarkTab,
 }
 
 impl Modelos {
     fn load(&mut self, ui: &Ui, sh: &Shared) {
         let bk = sh.bk.clone();
         self.t_list = Some(sh.bk.spawn(ui.ctx(), async move { tpls::list(&bk.db).await.map_err(backend::e) }));
+    }
+
+    fn load_bgs(&mut self, ctx: &egui::Context, sh: &Shared) {
+        let bk = sh.bk.clone();
+        self.t_bgs = Some(sh.bk.spawn(ctx, async move { tpls::list_clip_bgs(&bk.db).await.map_err(backend::e) }));
     }
 
     fn load_styles(&mut self, ctx: &egui::Context, sh: &Shared, pick: Option<i64>) {
@@ -78,6 +95,14 @@ impl Modelos {
             self.loaded = true;
             self.load(ui, sh);
             self.load_styles(ui.ctx(), sh, None);
+            self.load_bgs(ui.ctx(), sh);
+        }
+        if let Some(r) = self.t_bgs.as_ref().and_then(|t| t.take()) {
+            self.t_bgs = None;
+            match r {
+                Ok(l) => self.clip_bgs = l,
+                Err(e) => sh.toasts.err(e),
+            }
         }
         if let Some(r) = self.t_list.as_ref().and_then(|t| t.take()) {
             self.t_list = None;
@@ -110,14 +135,42 @@ impl Modelos {
             }
         }
 
-        let sub = if self.tab == Tab::Fundos { "Fundo fixo e a área onde cada vídeo entra" } else { "Como a legenda aparece no vídeo" };
+        let sub = match self.tab {
+            Tab::Fundos => "Fundo fixo e a área onde cada vídeo entra",
+            Tab::ClipBgs => "Imagens e vídeos para o fundo das áreas em Encaixar nos clipes",
+            Tab::Marcas => "Textos translúcidos por cima dos clipes, nos lugares que você escolher",
+            Tab::Legendas => "Como a legenda aparece no vídeo",
+        };
         let mut new = false;
+        let mut add_bg = false;
         w::page_head(ui, "Modelos", sub, |ui| {
             if self.tab == Tab::Fundos && w::button(ui, Kind::Primary, Some(ic::PLUS), "Novo modelo").clicked() {
                 new = true;
             }
-            w::seg(ui, &mut self.tab, &[(Tab::Fundos, "Fundos"), (Tab::Legendas, "Legendas")]);
+            if self.tab == Tab::ClipBgs {
+                ui.add_enabled_ui(self.t_bgs.is_none(), |ui| {
+                    if w::button(ui, Kind::Primary, Some(ic::IMAGE_PLUS), "Adicionar fundo").clicked() {
+                        add_bg = true;
+                    }
+                });
+            }
+            if self.tab == Tab::Marcas {
+                self.marcas.head(ui);
+            }
+            w::seg(ui, &mut self.tab, &[(Tab::Fundos, "Fundos"), (Tab::ClipBgs, "Fundos de clipe"), (Tab::Marcas, "Marcas d'água"), (Tab::Legendas, "Legendas")]);
         });
+        if add_bg {
+            if let Some(files) = rfd::FileDialog::new().set_title("Escolher fundos de clipe (imagem ou vídeo)").add_filter("Imagem ou vídeo", ALLOWED_BG).pick_files() {
+                let bk = sh.bk.clone();
+                self.t_bgs = Some(sh.bk.spawn(ui.ctx(), async move {
+                    for f in files {
+                        let name = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        tpls::add_clip_bg(&bk.db, &name, &f, &bk.cfg.templates_dir()).await.map_err(backend::e)?;
+                    }
+                    tpls::list_clip_bgs(&bk.db).await.map_err(backend::e)
+                }));
+            }
+        }
         if new {
             if let Some(f) = rfd::FileDialog::new().set_title("Escolher fundo (imagem ou vídeo)").add_filter("Imagem ou vídeo", ALLOWED_BG).pick_file() {
                 let name = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -127,7 +180,104 @@ impl Modelos {
 
         match self.tab {
             Tab::Fundos => self.fundos(ui, sh),
+            Tab::ClipBgs => self.clip_bgs(ui, sh),
+            Tab::Marcas => self.marcas.ui(ui, sh),
             Tab::Legendas => self.legendas(ui, sh),
+        }
+    }
+
+    /// Biblioteca de fundos de clipe: grade 9:16 com nome, tipo e apagar.
+    fn clip_bgs(&mut self, ui: &mut Ui, sh: &mut Shared) {
+        if self.clip_bgs.is_empty() {
+            w::card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                w::empty(ui, ic::IMAGE, "Nenhum fundo de clipe. Clique em Adicionar fundo e escolha imagens ou vídeos");
+                ui.vertical_centered(|ui| {
+                    ui.label(w::muted("Depois, no editor do clipe, ponha uma área em Encaixar e escolha Fundo do Encaixar › Arquivo"));
+                });
+                ui.add_space(24.0);
+            });
+            return;
+        }
+        let gap = 12.0;
+        let avail = ui.available_width();
+        let cols = ((avail + gap) / (150.0 + gap)).floor().max(1.0) as usize;
+        let cw = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
+        let th = cw * 16.0 / 9.0;
+        let mut del = None;
+        let mut rename_done: Option<(i64, String)> = None;
+        let list = self.clip_bgs.clone();
+        for row in list.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for b in row {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(cw, th + 54.0), Sense::hover());
+                    let p = ui.painter();
+                    p.rect(rect, CornerRadius::same(R_LG), CARD, Stroke::new(1.0, LINE), StrokeKind::Inside);
+                    let area = egui::Rect::from_min_size(rect.min + egui::vec2(1.0, 1.0), egui::vec2(cw - 2.0, th));
+                    p.rect_filled(area, CornerRadius { nw: R_LG, ne: R_LG, sw: 0, se: 0 }, Color32::BLACK);
+                    let path = Path::new(&b.file_path);
+                    match sh.thumbs.get(&sh.bk, ui.ctx(), path, 0.5, (360, 640)) {
+                        Some(tex) => media::paint_image(ui, &tex, area, true),
+                        None if !path.exists() => {
+                            ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, "Arquivo sumiu", body(T_META), ERR);
+                        }
+                        None => {}
+                    }
+                    let video = !flaxy_core::clips::ClipBg::is_image(&b.file_path);
+                    let tag = if video { "vídeo" } else { "imagem" };
+                    let g = ui.painter().layout_no_wrap(tag.to_string(), mono(T_META), TEXT);
+                    let tr = egui::Rect::from_min_size(area.left_top() + egui::vec2(6.0, 6.0), g.size() + egui::vec2(10.0, 4.0));
+                    ui.painter().rect_filled(tr, CornerRadius::same(4), Color32::from_black_alpha(190));
+                    ui.painter().galley(tr.min + egui::vec2(5.0, 2.0), g, TEXT);
+                    let foot = egui::Rect::from_min_max(egui::pos2(rect.left() + 12.0, area.bottom() + 6.0), rect.max - egui::vec2(6.0, 6.0));
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(foot).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let editing = self.rename_bg.as_ref().filter(|r| r.0 == b.id).cloned();
+                        match editing {
+                            Some((id, mut text)) => {
+                                let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(ui.available_width() - 4.0));
+                                if !r.has_focus() && !r.lost_focus() {
+                                    r.request_focus();
+                                }
+                                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if r.lost_focus() || enter {
+                                    rename_done = Some((id, text));
+                                } else {
+                                    self.rename_bg = Some((id, text));
+                                }
+                            }
+                            None => {
+                                ui.allocate_ui(egui::vec2(ui.available_width() - 32.0, 40.0), |ui| {
+                                    let r = ui.add(egui::Label::new(RichText::new(&b.name).font(body(T_SEC)).color(TEXT)).truncate().sense(Sense::click()));
+                                    if r.on_hover_text("Clique para renomear").clicked() {
+                                        self.rename_bg = Some((b.id, b.name.clone()));
+                                    }
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if w::icon_danger(ui, ic::TRASH_2, "Apagar").clicked() {
+                                        del = Some(b.clone());
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+            });
+            ui.add_space(gap - 8.0);
+        }
+        if let Some((id, name)) = rename_done {
+            self.rename_bg = None;
+            if self.clip_bgs.iter().any(|b| b.id == id && b.name != name.trim()) && !name.trim().is_empty() {
+                let bk = sh.bk.clone();
+                self.t_bgs = Some(sh.bk.spawn(ui.ctx(), async move {
+                    tpls::rename_clip_bg(&bk.db, id, &name).await.map_err(backend::e)?;
+                    tpls::list_clip_bgs(&bk.db).await.map_err(backend::e)
+                }));
+            }
+        }
+        if del.is_some() {
+            self.confirm_bg = del;
         }
     }
 
@@ -527,6 +677,7 @@ impl Modelos {
     }
 
     pub fn overlays(&mut self, ctx: &egui::Context, sh: &mut Shared) {
+        self.marcas.overlays(ctx, sh);
         if let Some(t) = self.confirm.clone() {
             match confirm(ctx, "tpl-del", &format!("Apagar o modelo \"{}\"?", t.name), "O arquivo de fundo copiado para o FLAXY também é apagado") {
                 Some(true) => {
@@ -539,6 +690,21 @@ impl Modelos {
                     self.confirm = None;
                 }
                 Some(false) => self.confirm = None,
+                None => {}
+            }
+        }
+        if let Some(b) = self.confirm_bg.clone() {
+            match confirm(ctx, "clip-bg-del", &format!("Apagar o fundo \"{}\"?", b.name), "Clipes que usavam este fundo voltam ao vídeo desfocado no próximo corte") {
+                Some(true) => {
+                    let bk = sh.bk.clone();
+                    self.t_bgs = Some(sh.bk.spawn(ctx, async move {
+                        tpls::delete_clip_bg(&bk.db, b.id, &bk.cfg.templates_dir()).await.map_err(backend::e)?;
+                        tpls::list_clip_bgs(&bk.db).await.map_err(backend::e)
+                    }));
+                    sh.thumbs.forget(Path::new(&b.file_path));
+                    self.confirm_bg = None;
+                }
+                Some(false) => self.confirm_bg = None,
                 None => {}
             }
         }

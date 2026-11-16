@@ -18,6 +18,36 @@ pub fn to_hex(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
+/// Retângulo (na tela) que um texto da marca d'água ocupa dentro de `rect`.
+pub fn watermark_rect(p: &egui::Painter, rect: Rect, t: &flaxy_core::watermarks::WmText, fonts: &[String]) -> Rect {
+    let g = watermark_galley(p, rect, t, fonts, Color32::WHITE);
+    Rect::from_center_size(egui::pos2(rect.left() + rect.width() * t.x as f32, rect.top() + rect.height() * t.y as f32), g.size())
+}
+
+fn watermark_galley(p: &egui::Painter, rect: Rect, t: &flaxy_core::watermarks::WmText, fonts: &[String], color: Color32) -> std::sync::Arc<egui::Galley> {
+    let family = if fonts.iter().any(|f| f == &t.font) { caption_family(&t.font, t.bold) } else if t.bold { medium() } else { egui::FontFamily::Proportional };
+    let size = (t.size as f32 * rect.height() / 1920.0).max(4.0);
+    p.layout_no_wrap(t.text.trim().to_string(), FontId::new(size, family), color)
+}
+
+/// Desenha os textos translúcidos da marca d'água no quadro `rect` (a saída).
+pub fn paint_watermark(p: &egui::Painter, rect: Rect, items: &[flaxy_core::watermarks::WmText], fonts: &[String]) {
+    for t in items.iter().filter(|t| !t.text.trim().is_empty()) {
+        let a = (t.opacity.clamp(0.0, 1.0) * 255.0) as u8;
+        let c = hex(&t.color);
+        let color = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+        let r = watermark_rect(p, rect, t, fonts);
+        if t.outline {
+            let shade = Color32::from_rgba_unmultiplied(0, 0, 0, a);
+            let o = (t.size as f32 * rect.height() / 1920.0 * 0.06).max(1.0);
+            for d in [egui::vec2(-o, 0.0), egui::vec2(o, 0.0), egui::vec2(0.0, -o), egui::vec2(0.0, o)] {
+                p.galley(r.min + d, watermark_galley(p, rect, t, fonts, shade), shade);
+            }
+        }
+        p.galley(r.min, watermark_galley(p, rect, t, fonts, color), color);
+    }
+}
+
 pub fn preview(ui: &mut Ui, st: &CaptionStyle, height: f32, fonts: &[String]) {
     let width = height * 9.0 / 16.0;
     let (outer, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());

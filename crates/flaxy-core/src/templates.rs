@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
 
-use crate::models::{Template, TemplateInput};
+use crate::models::{ClipBackground, Template, TemplateInput};
 use crate::{Error, Result};
 
 pub const ALLOWED_BG: &[&str] = &[
@@ -163,4 +163,52 @@ pub async fn duplicate(db: &SqlitePool, id: i64, templates_dir: &Path) -> Result
         duration_rule: tpl.duration_rule,
     };
     create(db, input, &new_path).await
+}
+
+// ------------------------------------------------------ fundos de clipe
+
+pub async fn list_clip_bgs(db: &SqlitePool) -> Result<Vec<ClipBackground>> {
+    Ok(sqlx::query_as("SELECT * FROM clip_backgrounds ORDER BY created_at DESC, id DESC").fetch_all(db).await?)
+}
+
+/// Copia `src` para a pasta de modelos e guarda na biblioteca de fundos de clipe.
+pub async fn add_clip_bg(db: &SqlitePool, name: &str, src: &Path, templates_dir: &Path) -> Result<ClipBackground> {
+    let file = src.file_name().and_then(|n| n.to_str()).ok_or_else(|| Error::Invalid("Nome de arquivo inválido".into()))?;
+    let dest = templates_dir.join(unique_filename(file, ALLOWED_BG)?);
+    tokio::fs::create_dir_all(templates_dir).await?;
+    tokio::fs::copy(src, &dest).await?;
+    let name = if name.trim().is_empty() { "Fundo" } else { name.trim() };
+    Ok(sqlx::query_as("INSERT INTO clip_backgrounds (name, file_path) VALUES (?, ?) RETURNING *")
+        .bind(name)
+        .bind(dest.to_string_lossy().into_owned())
+        .fetch_one(db)
+        .await?)
+}
+
+pub async fn rename_clip_bg(db: &SqlitePool, id: i64, name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::Invalid("Nome do fundo é obrigatório".into()));
+    }
+    sqlx::query("UPDATE clip_backgrounds SET name=? WHERE id=?").bind(name.trim()).bind(id).execute(db).await?;
+    Ok(())
+}
+
+/// Tira da biblioteca. O arquivo só é apagado se nenhum clipe ainda o usa;
+/// clipes que usavam voltam ao fundo desfocado no próximo corte.
+pub async fn delete_clip_bg(db: &SqlitePool, id: i64, templates_dir: &Path) -> Result<()> {
+    let bg: ClipBackground = sqlx::query_as("SELECT * FROM clip_backgrounds WHERE id=?")
+        .bind(id)
+        .fetch_optional(db)
+        .await?
+        .ok_or(Error::NotFound("Fundo"))?;
+    sqlx::query("DELETE FROM clip_backgrounds WHERE id=?").bind(id).execute(db).await?;
+    let (used,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM clip_items WHERE bg_path=? AND status IN ('queued','processing')")
+        .bind(&bg.file_path)
+        .fetch_one(db)
+        .await?;
+    let path = Path::new(&bg.file_path);
+    if used == 0 && path.starts_with(templates_dir) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    Ok(())
 }

@@ -15,6 +15,7 @@ pub mod media;
 pub mod models;
 pub mod templates;
 pub mod transcripts;
+pub mod watermarks;
 
 pub use config::Config;
 pub use error::{Error, Result};

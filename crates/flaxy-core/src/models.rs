@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+/// Fundo personalizado para os clipes (sobra das áreas em Encaixar).
+#[derive(Debug, Clone, Serialize, FromRow, PartialEq)]
+pub struct ClipBackground {
+    pub id: i64,
+    pub name: String,
+    pub file_path: String,
+    pub created_at: String,
+}
+
 /// Template: fundo fixo + área onde o vídeo bruto entra.
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Template {
