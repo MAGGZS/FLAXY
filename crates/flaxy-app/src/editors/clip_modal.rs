@@ -9,7 +9,7 @@
 //! - Desfazer/refazer e atalhos de teclado.
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Ui};
-use flaxy_core::captions::{CaptionStyle, Word};
+use flaxy_core::captions::{CaptionStyle, Style, Word};
 use flaxy_core::watermarks::Watermark;
 use flaxy_core::clips::{
     area_segments, caption_parts, kept_len, kept_ranges, pause_cuts, smooth_segments, AreaFit, ClipBg, Ease, Place, EASE_Y_MAX, EASE_Y_MIN, PLACE_SCALE_MIN, SMOOTH_MAX, SMOOTH_MIN, SMOOTH_SECS, AreaKey, CaptionAdjust, CaptionKey, Cut, Rect as FRect, Vertical, WordEdit,
@@ -127,7 +127,7 @@ impl Tab {
             Tab::Frame => ("Enquadrar", "Que parte do vídeo entra em cada espaço do clipe e onde ela fica"),
             Tab::Motion => ("Trocas de área", "Mude o enquadramento ao longo do clipe, com corte seco ou deslizando"),
             Tab::Trim => ("Trecho", "Início, fim e o que sai de dentro do clipe"),
-            Tab::Caption => ("Legenda", "Lugar e tamanho da legenda só neste clipe"),
+            Tab::Caption => ("Legenda", "Modelo, lugar e tamanho da legenda"),
             Tab::Text => ("Texto da legenda", "Corrija ou apague palavras que a transcrição errou"),
             Tab::Mark => ("Marca d'água", "Textos translúcidos por cima do clipe"),
         }
@@ -312,8 +312,10 @@ pub struct Init {
     pub title: String,
     pub src: std::path::PathBuf,
     pub edit: Edit,
-    /// Modelo de legenda escolhido na tela de Clipes (None = sem legenda).
-    pub style: Option<CaptionStyle>,
+    /// Modelos de legenda (aba Modelos) e o escolhido na tela de Clipes
+    /// (None = sem legenda). Trocar aqui volta para a tela de Clipes ao salvar.
+    pub styles: Vec<Style>,
+    pub style_id: Option<i64>,
     /// Palavras da transcrição em volta do clipe (tempos da fonte).
     pub words: Vec<Word>,
     pub volume: f32,
@@ -331,6 +333,8 @@ pub struct ClipModal {
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     style: Option<CaptionStyle>,
+    styles: Vec<Style>,
+    style_id: Option<i64>,
     words: Vec<Word>,
     player: Player,
     drag: Option<(Key, Grip, FRect, Pos2)>,
@@ -379,7 +383,9 @@ impl ClipModal {
             s,
             undo: Vec::new(),
             redo: Vec::new(),
-            style: i.style,
+            style: i.style_id.and_then(|id| i.styles.iter().find(|s| s.row.id == id)).map(|s| s.style.clone()),
+            styles: i.styles,
+            style_id: i.style_id,
             words: i.words,
             player,
             drag: None,
@@ -761,6 +767,35 @@ impl ClipModal {
             if let Some(id) = pick {
                 self.s.watermark_id = Some(id);
             }
+        }
+    }
+
+    /// Modelo de legenda escolhido no editor (None = sem legenda).
+    pub fn style_id(&self) -> Option<i64> {
+        self.style_id
+    }
+
+    /// Escolha do modelo de legenda (o mesmo da tela de Clipes).
+    fn style_picker(&mut self, ui: &mut Ui) {
+        let cur = self.style_id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| s.row.name.clone()).unwrap_or_else(|| "Sem legenda".into());
+        let mut pick: Option<Option<i64>> = None;
+        egui::ComboBox::from_id_salt("clip-modal-style").width(SIDE_W).selected_text(format!("{}  {cur}", ic::CAPTIONS)).show_ui(ui, |ui| {
+            if ui.selectable_label(self.style_id.is_none(), "Sem legenda").clicked() {
+                pick = Some(None);
+            }
+            for s in &self.styles {
+                if ui.selectable_label(self.style_id == Some(s.row.id), &s.row.name).clicked() {
+                    pick = Some(Some(s.row.id));
+                }
+            }
+        });
+        if let Some(id) = pick {
+            self.style_id = id;
+            self.style = id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| s.style.clone());
+        }
+        if self.styles.is_empty() {
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(w::muted("Crie um modelo de legenda em Modelos para usar aqui")).wrap());
         }
     }
 
@@ -1999,10 +2034,15 @@ impl ClipModal {
     }
 
     fn caption_panel(&mut self, ui: &mut Ui) {
+        group(ui, "Modelo");
+        self.style_picker(ui);
         let Some(base) = self.style.clone() else {
-            ui.add(egui::Label::new(w::muted("Escolha um modelo de legenda na tela de Clipes para ajustar aqui")).wrap());
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(w::muted("Escolha um modelo para pôr legenda no clipe. Vale para todos os clipes deste vídeo")).wrap());
             return;
         };
+        ui.add(egui::Label::new(w::muted("Vale para todos os clipes deste vídeo")).wrap());
+        gap(ui);
         let t = self.now();
         let cur = self.cap_at(t);
         let mut adj = cur.clone().unwrap_or_else(|| CaptionAdjust::from_style(&base));

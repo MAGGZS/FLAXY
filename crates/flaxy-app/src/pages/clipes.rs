@@ -1280,7 +1280,8 @@ impl Clipes {
                     title: c.row.title.clone(),
                     src: PathBuf::from(src),
                     edit: d.e.clone(),
-                    style: self.style_id.and_then(|id| self.styles.iter().find(|s| s.row.id == id)).map(|s| s.style.clone()),
+                    styles: self.styles.clone(),
+                    style_id: self.style_id,
                     words,
                     volume: if self.muted { 0.0 } else { self.volume },
                     backgrounds: self.backgrounds.clone(),
@@ -1299,6 +1300,7 @@ impl Clipes {
                 clip_modal::Outcome::Open => {}
                 clip_modal::Outcome::Close => self.editing = None,
                 clip_modal::Outcome::Save(e) => {
+                    self.style_id = ed.style_id();
                     if let Some(d) = self.drafts.get_mut(&ed.clip_id) {
                         d.e = e;
                     }
@@ -1306,6 +1308,7 @@ impl Clipes {
                     sh.toasts.ok("Edição do clipe salva. Vale no próximo corte");
                 }
                 clip_modal::Outcome::SaveAll(e) => {
+                    self.style_id = ed.style_id();
                     let me = ed.clip_id;
                     let n = self.drafts.len().saturating_sub(1);
                     for (id, d) in self.drafts.iter_mut() {
