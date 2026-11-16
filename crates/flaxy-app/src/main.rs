@@ -12,6 +12,7 @@ mod media;
 mod pages;
 mod prospect;
 mod theme;
+mod updater;
 mod widgets;
 mod youtube;
 
@@ -49,16 +50,28 @@ fn locate_tools() {
 }
 
 /// Uma instância por vez: duas filas no mesmo banco renderizariam em dobro.
-/// Se já existe, traz a janela aberta para frente e sai.
+/// Se já existe, traz a janela aberta para frente e sai. Depois de uma
+/// atualização (`wait`), espera a instância antiga terminar de fechar.
 #[cfg(windows)]
-fn single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+fn single_instance(wait: bool) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let name = wide("Local\\FLAXY.single-instance");
     unsafe {
-        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        let mut h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if wait {
+            // Até 30 s: a instância antiga encerra a fila antes de sair.
+            for _ in 0..150 {
+                if h.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+                    break;
+                }
+                CloseHandle(h);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            }
+        }
         if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
             let title = wide(APP_TITLE);
             let w = FindWindowW(std::ptr::null(), title.as_ptr());
@@ -74,7 +87,7 @@ fn single_instance() -> bool {
 }
 
 #[cfg(not(windows))]
-fn single_instance() -> bool {
+fn single_instance(_wait: bool) -> bool {
     true
 }
 
@@ -103,9 +116,11 @@ fn fatal(msg: &str) {
 
 fn main() {
     // FLAXY_MULTI=1 permite uma segunda janela (teste com outra pasta de dados).
-    if std::env::var_os("FLAXY_MULTI").is_none() && !single_instance() {
+    let after_update = std::env::args().any(|a| a == updater::RELAUNCH_ARG);
+    if std::env::var_os("FLAXY_MULTI").is_none() && !single_instance(after_update) {
         return;
     }
+    updater::cleanup();
     locate_tools();
     let cfg = flaxy_core::Config::desktop();
     init_logs(&cfg);
@@ -154,4 +169,7 @@ fn main() {
     // volta para a fila na próxima abertura.
     drop(bk);
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    if updater::relaunch_requested() {
+        updater::spawn_new();
+    }
 }

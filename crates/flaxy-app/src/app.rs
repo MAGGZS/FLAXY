@@ -51,8 +51,12 @@ pub struct App {
 
 impl App {
     pub fn new(bk: Arc<Backend>, caption_fonts: Vec<String>) -> Self {
+        let mut toasts = Toasts::default();
+        if std::env::args().any(|a| a == crate::updater::RELAUNCH_ARG) {
+            toasts.ok(format!("FLAXY atualizado para v{}", env!("CARGO_PKG_VERSION")));
+        }
         Self {
-            sh: Shared { bk, toasts: Toasts::default(), thumbs: Thumbs::default(), goto: None, clip_url: None, caption_fonts },
+            sh: Shared { bk, toasts, thumbs: Thumbs::default(), goto: None, clip_url: None, caption_fonts },
             // FLAXY_PAGE abre direto numa página (atalho de desenvolvimento).
             page: match std::env::var("FLAXY_PAGE").unwrap_or_default().as_str() {
                 "lotes" => Page::Lotes,
@@ -243,8 +247,14 @@ impl eframe::App for App {
                     self.confirm_close = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                Some(false) => self.confirm_close = false,
-                None if !open => self.confirm_close = false,
+                Some(false) => {
+                    self.confirm_close = false;
+                    crate::updater::cancel_restart();
+                }
+                None if !open => {
+                    self.confirm_close = false;
+                    crate::updater::cancel_restart();
+                }
                 None => {}
             }
         }

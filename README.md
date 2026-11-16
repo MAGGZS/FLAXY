@@ -35,6 +35,13 @@ Precisa de Rust (`cargo`) e, só para gerar o instalador, do NSIS.
 | `tools\fetch-tools.ps1` | Baixa ffmpeg, ffprobe, yt-dlp e whisper-cli para `bin\` (só o que falta) |
 | `run-app.bat` | Abre o app em modo de desenvolvimento |
 | `build-installer.bat` | Compila em release e gera `target\release\FLAXY-Setup-<versão>.exe` |
+| `release.bat` | Gera o instalador e publica a versão de `Cargo.toml` no GitHub Releases (precisa de `GITHUB_TOKEN`) |
+
+Atualizar sem rodar o instalador: aumente `version` em `Cargo.toml`, faça
+push e rode `release.bat`. No app, Configurações > Atualizações >
+"Verificar atualizações" baixa o novo `FLAXY.exe` (com barra de progresso e
+conferência de SHA-256), troca o executável e oferece "Reiniciar e abrir
+atualizado".
 
 | Pasta | O quê |
 |---|---|
