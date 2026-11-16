@@ -127,6 +127,12 @@ pub struct Clipes {
     confirm_delete: Option<Project>,
     /// Pedido de remover as sugestões da IA (id do projeto), esperando confirmação.
     confirm_clear: Option<i64>,
+    /// Aviso da IA (projeto, mensagem): análise falhou, mas a linha do tempo abre.
+    ai_warn: Option<(i64, String)>,
+    /// Projetos cujo aviso da IA já foi visto (não volta antes do banco atualizar).
+    ai_seen: std::collections::HashSet<i64>,
+    /// Análise de retenção rodando de novo com a linha do tempo aberta.
+    t_analyze: Option<Task<Res<ProjectView>>>,
     /// Trecho mostrado na prévia 9:16.
     focus: Option<i64>,
     volume: f32,
@@ -170,6 +176,9 @@ impl Default for Clipes {
             last_poll: 0.0,
             confirm_delete: None,
             confirm_clear: None,
+            ai_warn: None,
+            ai_seen: Default::default(),
+            t_analyze: None,
             focus: None,
             volume: 0.8,
             muted: false,
@@ -246,6 +255,11 @@ impl Clipes {
         if self.player.is_none() {
             if let Some(src) = v.project.source_path.as_deref().filter(|_| v.project.status == "ready") {
                 self.player = Some(Player::new(src, 0.5, (960, 540)).with_audio());
+            }
+        }
+        if v.project.status == "ready" && self.ai_warn.is_none() && !self.ai_seen.contains(&v.project.id) {
+            if let Some(m) = v.project.error_msg.clone().filter(|m| !m.is_empty()) {
+                self.ai_warn = Some((v.project.id, m));
             }
         }
         self.view = Some(v);
@@ -344,6 +358,35 @@ impl Clipes {
                     }
                 }
                 Err(e) => sh.toasts.err(e),
+            }
+        }
+        if let Some(r) = self.t_analyze.as_ref().and_then(|t| t.take()) {
+            self.t_analyze = None;
+            match r {
+                Ok(v) => {
+                    // Sugestões antigas da IA saíram: esquece as edições delas.
+                    let ids: std::collections::HashSet<i64> = v.clips.iter().map(|c| c.row.id).collect();
+                    if self.view.as_ref().is_some_and(|o| o.project.id == v.project.id) {
+                        if let Some(o) = self.view.as_ref() {
+                            for c in o.clips.iter().filter(|c| !ids.contains(&c.row.id)) {
+                                self.drafts.remove(&c.row.id);
+                                if self.focus == Some(c.row.id) {
+                                    self.focus = None;
+                                }
+                            }
+                        }
+                    }
+                    let n = v.clips.iter().filter(|c| is_ai_pending(c)).count();
+                    if self.sel == Some(v.project.id) {
+                        self.apply_view(v);
+                    }
+                    sh.toasts.ok(format!("Análise de retenção pronta: {n} sugestões da IA"));
+                }
+                Err(e) => {
+                    if let Some(pid) = self.sel {
+                        self.ai_warn = Some((pid, e.to_string()));
+                    }
+                }
             }
         }
         if let Some(r) = self.t_delete.as_ref().and_then(|t| t.take()) {
@@ -730,7 +773,7 @@ impl Clipes {
                             }
                             ui.label(w::mono_text(format!("{} / {}", timecode(pos, true), timecode(p.duration, true)), T_META, TEXT_2));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if volume_bar(ui, &mut self.volume, self.muted) && self.volume > 0.0 {
+                                if w::volume_bar(ui, &mut self.volume, self.muted) && self.volume > 0.0 {
                                     self.muted = false;
                                 }
                                 let off = self.muted || self.volume <= 0.0;
@@ -1057,7 +1100,17 @@ impl Clipes {
         let mut remove: Option<i64> = None;
         let ai_left = v.clips.iter().filter(|c| is_ai_pending(c)).count();
         let mut ask_clear = false;
+        let mut analyze = false;
         w::card(ui, "Clipes", &format!("{} · {approved} aprovados", v.clips.len()), |ui| {
+            ui.add_enabled_ui(self.t_analyze.is_none() && self.t_clip.is_none() && p.transcript_id.is_some(), |ui| {
+                let label = if self.t_analyze.is_some() { "Analisando retenção" } else { "Analisar retenção" };
+                if w::button(ui, Kind::Default, Some(ic::TRENDING_UP), label)
+                    .on_hover_text("A IA procura de novo os melhores trechos, sem sair desta tela. Troca as sugestões da IA ainda não cortadas; clipes feitos à mão e os já cortados ficam")
+                    .clicked()
+                {
+                    analyze = true;
+                }
+            });
             ui.add_enabled_ui(self.t_clip.is_none() && p.source_path.is_some(), |ui| {
                 if w::button(ui, Kind::Default, Some(ic::PLUS), "Adicionar clipe aqui").on_hover_text("Cria um clipe a partir da agulha. Também dá para arrastar num espaço vazio do mapa").clicked() {
                     add_here = true;
@@ -1219,6 +1272,10 @@ impl Clipes {
         if ask_clear {
             self.confirm_clear = Some(p.id);
         }
+        if analyze {
+            let (bk, id) = (sh.bk.clone(), p.id);
+            self.t_analyze = Some(sh.bk.spawn(ui.ctx(), async move { bk.clips.reanalyze(id).await.map_err(backend::e) }));
+        }
         // Del com um clipe selecionado no mapa: tira ele da lista.
         if remove.is_none()
             && self.editing.is_none()
@@ -1283,7 +1340,8 @@ impl Clipes {
                     styles: self.styles.clone(),
                     style_id: self.style_id,
                     words,
-                    volume: if self.muted { 0.0 } else { self.volume },
+                    volume: self.volume,
+                    muted: self.muted,
                     backgrounds: self.backgrounds.clone(),
                     watermarks: self.watermarks.clone(),
                 }));
@@ -1296,7 +1354,17 @@ impl Clipes {
     pub fn overlays(&mut self, ctx: &egui::Context, sh: &mut Shared) {
         if let Some(ed) = self.editing.as_mut() {
             let bg_tex = ed.bg_file().and_then(|f| sh.thumbs.get(&sh.bk, ctx, Path::new(f), 0.5, (540, 960)));
-            match ed.show(ctx, &sh.caption_fonts, bg_tex) {
+            let res = ed.show(ctx, &sh.caption_fonts, bg_tex);
+            // O volume escolhido no editor vale também no player da tela.
+            let (vol, muted) = ed.volume();
+            if (vol, muted) != (self.volume, self.muted) {
+                self.volume = vol;
+                self.muted = muted;
+                if let Some(p) = self.player.as_mut() {
+                    p.set_volume(if muted { 0.0 } else { vol });
+                }
+            }
+            match res {
                 clip_modal::Outcome::Open => {}
                 clip_modal::Outcome::Close => self.editing = None,
                 clip_modal::Outcome::Save(e) => {
@@ -1334,6 +1402,33 @@ impl Clipes {
                     self.editing = None;
                     sh.toasts.ok(format!("Edição salva e aplicada a mais {n} clipes. Vale no próximo corte"));
                 }
+            }
+        }
+        if let Some((pid, msg)) = self.ai_warn.clone() {
+            let (open, ok) = w::modal(ctx, "clip-ai-warn", "A IA não conseguiu analisar", "", 500.0, |ui| {
+                let mut c = false;
+                w::pad(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(&msg).color(ERR)).wrap());
+                    ui.add_space(12.0);
+                    ui.add(egui::Label::new(w::dim("O vídeo e a transcrição estão prontos. Marque os clipes à mão arrastando no mapa de retenção, ou clique em \"Analisar retenção\" mais tarde para a IA tentar de novo.")).wrap());
+                    ui.add_space(16.0);
+                    if w::button(ui, Kind::Primary, Some(ic::CHECK), "Entendi").clicked() {
+                        c = true;
+                    }
+                });
+                c
+            });
+            if ok == Some(true) || !open {
+                self.ai_warn = None;
+                self.ai_seen.insert(pid);
+                if let Some(v) = self.view.as_mut().filter(|v| v.project.id == pid) {
+                    v.project.error_msg = None;
+                }
+                if let Some(p) = self.projects.iter_mut().find(|p| p.id == pid) {
+                    p.error_msg = None;
+                }
+                let bk = sh.bk.clone();
+                drop(sh.bk.spawn(ctx, async move { bk.clips.dismiss_warning(pid).await.map_err(backend::e) }));
             }
         }
         if let Some(pid) = self.confirm_clear {
@@ -1410,25 +1505,3 @@ impl Clipes {
     }
 }
 
-/// Volume: trilho fino, preenchido até o nível, arrastável. Devolve true se mudou.
-fn volume_bar(ui: &mut Ui, v: &mut f32, muted: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(96.0, 20.0), Sense::click_and_drag());
-    let track = Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 8.0, 4.0));
-    let mut changed = false;
-    if let Some(pp) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
-        let nv = ((pp.x - track.left()) / track.width()).clamp(0.0, 1.0);
-        changed = (nv - *v).abs() > f32::EPSILON;
-        *v = nv;
-    }
-    let level = if muted { 0.0 } else { *v };
-    let p = ui.painter();
-    p.rect_filled(track, CornerRadius::same(2), RAISED_2);
-    let x = track.left() + track.width() * level;
-    p.rect_filled(Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), CornerRadius::same(2), if resp.hovered() || resp.dragged() { TEXT } else { TEXT_2 });
-    p.circle_filled(egui::pos2(x, track.center().y), if resp.hovered() || resp.dragged() { 6.0 } else { 5.0 }, TEXT);
-    let resp = resp.on_hover_text(format!("Volume {}%", (level * 100.0).round()));
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    changed
-}

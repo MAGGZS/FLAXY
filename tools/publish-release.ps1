@@ -23,9 +23,20 @@ $token = $env:GITHUB_TOKEN
 if (-not $token) {
     # Sem GITHUB_TOKEN: usa a credencial que o Git já guarda para o github.com
     # (a mesma do `git push`). Nunca é impressa.
-    $cred = "protocol=https`nhost=github.com`n`n" | git credential fill 2>$null
+    # A entrada vai por arquivo sem BOM: o pipe do PowerShell pode pôr um BOM
+    # na frente e o Git recusa ("credential missing protocol field").
+    $in = [IO.Path]::GetTempFileName()
+    try {
+        [IO.File]::WriteAllText($in, "protocol=https`nhost=github.com`n`n", (New-Object Text.UTF8Encoding $false))
+        $cred = cmd /c "git credential fill < `"$in`" 2>nul"
+    } finally {
+        Remove-Item $in -ErrorAction SilentlyContinue
+    }
     $line = $cred | Where-Object { $_ -like "password=*" } | Select-Object -First 1
     if ($line) { $token = $line.Substring(9) }
+}
+if (-not $token -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+    $token = (gh auth token 2>$null)
 }
 if (-not $token) {
     Write-Host "Defina GITHUB_TOKEN (permissao Contents: write) ou faca login no Git para o github.com." -ForegroundColor Red

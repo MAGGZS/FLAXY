@@ -2,7 +2,7 @@
 //! barra de progresso, régua de tempo e avisos.
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Response, RichText, Sense, Stroke,
+    self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Response, RichText, Sense, Stroke,
     StrokeKind, Ui, Vec2,
 };
 
@@ -421,4 +421,27 @@ pub fn fixed(ui: &mut Ui, width: f32, text: impl Into<egui::WidgetText>) {
         ui.set_width(width);
         ui.add(egui::Label::new(text).truncate());
     });
+}
+
+/// Volume: trilho fino, preenchido até o nível, arrastável. Devolve true se mudou.
+pub fn volume_bar(ui: &mut Ui, v: &mut f32, muted: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(96.0, 20.0), Sense::click_and_drag());
+    let track = Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 8.0, 4.0));
+    let mut changed = false;
+    if let Some(pp) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+        let nv = ((pp.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        changed = (nv - *v).abs() > f32::EPSILON;
+        *v = nv;
+    }
+    let level = if muted { 0.0 } else { *v };
+    let p = ui.painter();
+    p.rect_filled(track, CornerRadius::same(2), RAISED_2);
+    let x = track.left() + track.width() * level;
+    p.rect_filled(Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), CornerRadius::same(2), if resp.hovered() || resp.dragged() { TEXT } else { TEXT_2 });
+    p.circle_filled(egui::pos2(x, track.center().y), if resp.hovered() || resp.dragged() { 6.0 } else { 5.0 }, TEXT);
+    let resp = resp.on_hover_text(format!("Volume {}%", (level * 100.0).round()));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    changed
 }

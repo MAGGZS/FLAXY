@@ -186,6 +186,9 @@ impl eframe::App for App {
             self.confirm_close = true;
         }
 
+        // Procura versão nova ao abrir e baixa sozinho (vale ao reabrir).
+        self.config.auto_update(&ctx, &mut self.sh);
+
         self.sidebar(ui);
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(BG))

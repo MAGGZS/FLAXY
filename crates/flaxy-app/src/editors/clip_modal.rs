@@ -319,6 +319,7 @@ pub struct Init {
     /// Palavras da transcrição em volta do clipe (tempos da fonte).
     pub words: Vec<Word>,
     pub volume: f32,
+    pub muted: bool,
     /// Fundos personalizados (aba Modelos › Fundos de clipe).
     pub backgrounds: Vec<flaxy_core::models::ClipBackground>,
     /// Marcas d'água (aba Modelos › Marcas d'água).
@@ -361,12 +362,15 @@ pub struct ClipModal {
     place_drag: Option<(Key, Rect, Pos2)>,
     /// Travas em uso no arraste da prévia (x, y), já em px da tela.
     place_guides: (Option<f32>, Option<f32>),
+    /// Volume da reprodução (0..1) e mudo.
+    volume: f32,
+    muted: bool,
 }
 
 impl ClipModal {
     pub fn new(i: Init) -> Self {
         let mut player = Player::new(&i.src, i.edit.start, (960, 540)).with_audio();
-        player.set_volume(i.volume);
+        player.set_volume(if i.muted { 0.0 } else { i.volume });
         let mut s = i.edit;
         s.end = s.end.max(s.start + 1.0);
         s.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
@@ -404,6 +408,8 @@ impl ClipModal {
             tab: Tab::Frame,
             place_drag: None,
             place_guides: (None, None),
+            volume: i.volume,
+            muted: i.muted,
         }
     }
 
@@ -770,6 +776,11 @@ impl ClipModal {
         }
     }
 
+    /// Volume e mudo escolhidos no editor (para a tela de Clipes lembrar).
+    pub fn volume(&self) -> (f32, bool) {
+        (self.volume, self.muted)
+    }
+
     /// Modelo de legenda escolhido no editor (None = sem legenda).
     pub fn style_id(&self) -> Option<i64> {
         self.style_id
@@ -1062,6 +1073,29 @@ impl ClipModal {
             }
             if let Some(a) = self.cut_mark {
                 ui.label(w::mono_text(format!("· corte desde {}", timecode(a - self.s.start, false)), T_META, MARK));
+            }
+            // Volume logo depois do tempo, como no player da tela de Clipes.
+            ui.add_space(8.0);
+            let off = self.muted || self.volume <= 0.0;
+            let icon = if off { ic::VOLUME_X } else if self.volume < 0.5 { ic::VOLUME_1 } else { ic::VOLUME_2 };
+            let mut vol_changed = false;
+            if w::icon_button(ui, icon, if off { "Ligar som" } else { "Sem som" }).clicked() {
+                if self.volume <= 0.0 {
+                    self.volume = 0.8;
+                    self.muted = false;
+                } else {
+                    self.muted = !self.muted;
+                }
+                vol_changed = true;
+            }
+            if w::volume_bar(ui, &mut self.volume, self.muted) {
+                if self.volume > 0.0 {
+                    self.muted = false;
+                }
+                vol_changed = true;
+            }
+            if vol_changed {
+                self.player.set_volume(if self.muted { 0.0 } else { self.volume });
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;

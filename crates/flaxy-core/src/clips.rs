@@ -1280,9 +1280,29 @@ impl Clips {
             self.transcribe(id, &ctx, &src, &settings).await?
         };
 
-        // 3. Análise de retenção
+        // 3. Análise de retenção. Se a IA falhar (limite, chave, nada achado),
+        // o vídeo fica pronto mesmo assim, com um aviso, para marcar à mão.
         self.set_status(id, "analyzing", 0).await;
-        let suggestions = analyze(&settings, &words, p.min_len, p.max_len, probe.duration).await?;
+        let warn = match self.suggest(id, &settings, &words, &p, probe.duration, w, h).await {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!("projeto de clipes {id}: análise da IA falhou: {e}");
+                Some(e.to_string())
+            }
+        };
+        sqlx::query("UPDATE clip_projects SET status='ready', progress=100, error_msg=? WHERE id=?")
+            .bind(warn)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Pede os trechos à IA e grava como sugestões. Erro quando a IA falha
+    /// ou não acha nada (nada é gravado nesse caso).
+    #[allow(clippy::too_many_arguments)]
+    async fn suggest(&self, id: i64, settings: &ai::AiSettings, words: &[Word], p: &Project, duration: f64, w: i64, h: i64) -> Result<()> {
+        let suggestions = analyze(settings, words, p.min_len, p.max_len, duration).await?;
         if suggestions.is_empty() {
             return Err(Error::Invalid("A IA não encontrou trechos dentro da duração escolhida".into()));
         }
@@ -1303,7 +1323,57 @@ impl Clips {
             .execute(&self.db)
             .await?;
         }
-        self.set_status(id, "ready", 100).await;
+        Ok(())
+    }
+
+    /// Roda de novo a análise de retenção num vídeo pronto, sem sair da tela.
+    /// Troca as sugestões da IA ainda não cortadas pelas novas; clipes feitos
+    /// à mão e os já cortados ficam. Se a IA falhar, nada muda e volta o erro.
+    pub async fn reanalyze(&self, id: i64) -> Result<ProjectView> {
+        let p = self.get(id).await?.project;
+        if p.status != "ready" {
+            return Err(Error::Invalid("Esse vídeo ainda está sendo preparado".into()));
+        }
+        let tid = p.transcript_id.ok_or_else(|| Error::Invalid("Esse vídeo não tem transcrição".into()))?;
+        let (raw,): (String,) = sqlx::query_as("SELECT words FROM transcripts WHERE id=?").bind(tid).fetch_one(&self.db).await?;
+        let words: Vec<Word> = serde_json::from_str(&raw)?;
+        let settings = ai::load(&self.db).await?;
+        let suggestions = analyze(&settings, &words, p.min_len, p.max_len, p.duration).await?;
+        if suggestions.is_empty() {
+            return Err(Error::Invalid("A IA não encontrou trechos dentro da duração escolhida".into()));
+        }
+        let mut tx = self.db.begin().await?;
+        sqlx::query(&format!(
+            "DELETE FROM clip_items WHERE project_id=? AND reason IS NOT '{MANUAL_REASON}' AND status NOT IN ('queued','processing','done')"
+        ))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        let (cam, scr) = suggest_rects(&p.layout, p.width, p.height);
+        for s in suggestions {
+            sqlx::query(
+                "INSERT INTO clip_items (project_id, start, end, score, title, reason, layout, camera_rect, screen_rect)                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(s.start)
+            .bind(s.end)
+            .bind(s.score)
+            .bind(&s.title)
+            .bind(&s.reason)
+            .bind(&p.layout)
+            .bind(serde_json::to_string(&cam)?)
+            .bind(serde_json::to_string(&scr)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE clip_projects SET error_msg=NULL WHERE id=?").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        self.get(id).await
+    }
+
+    /// Esquece o aviso da IA de um vídeo pronto (depois que o usuário viu).
+    pub async fn dismiss_warning(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE clip_projects SET error_msg=NULL WHERE id=? AND status='ready'").bind(id).execute(&self.db).await?;
         Ok(())
     }
 

@@ -230,7 +230,7 @@ async fn latest() -> Result<Option<Release>, String> {
 }
 
 /// `a` é mais nova que `b`? Compara números separados por ponto ("2.10.0" > "2.9.3").
-fn newer(a: &str, b: &str) -> bool {
+pub fn newer(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> { s.split(['.', '-', '+']).map(|p| p.parse().unwrap_or(0)).take(3).collect() };
     let (mut x, mut y) = (parse(a), parse(b));
     x.resize(3, 0);

@@ -17,6 +17,9 @@ pub struct Config {
     dirty: bool,
     t_save: Option<Task<Res<()>>>,
     upd: Updater,
+    /// Etapa da atualização automática ao abrir: 0 = vai checar,
+    /// 1 = checando, 2 = baixando, 3 = terminou.
+    auto: u8,
 }
 
 fn mb(b: u64) -> String {
@@ -158,6 +161,39 @@ impl Config {
             }));
         }
     }
+    /// Ao abrir o app: procura versão nova e, se houver, baixa e troca o
+    /// executável em segundo plano. Vale na próxima vez que o FLAXY abrir
+    /// (ou já, pelo botão de reiniciar em Configurações).
+    pub fn auto_update(&mut self, ctx: &egui::Context, sh: &mut Shared) {
+        // Build de desenvolvimento não se troca sozinho.
+        if cfg!(debug_assertions) || std::env::var_os("FLAXY_NO_AUTO_UPDATE").is_some() {
+            self.auto = 3;
+        }
+        match self.auto {
+            0 => {
+                self.auto = 1;
+                sh.bk.spawn(ctx, self.upd.check(ctx));
+            }
+            1 => match self.upd.phase() {
+                Phase::Available(r) => {
+                    self.auto = 2;
+                    sh.bk.spawn(ctx, self.upd.install(ctx, r));
+                }
+                Phase::Checking => {}
+                _ => self.auto = 3,
+            },
+            2 => match self.upd.phase() {
+                Phase::Ready { version } => {
+                    self.auto = 3;
+                    sh.toasts.ok(format!("FLAXY v{version} baixado. Abre atualizado na próxima vez, ou reinicie em Configurações › Atualizações"));
+                }
+                Phase::Failed(_) => self.auto = 3,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     /// Cartão de atualização: verificar, baixar com progresso e reiniciar.
     fn updates(&mut self, ui: &mut Ui, sh: &mut Shared) {
         let phase = self.upd.phase();
@@ -187,7 +223,11 @@ impl Config {
                     Phase::UpToDate { latest } => {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(ic::CHECK).size(ICON).color(OK));
-                            ui.label(w::dim(format!("Você já está na versão mais nova (v{latest}).")));
+                            ui.label(w::dim(if updater::newer(cur, latest) {
+                                format!("Você está na v{cur}, mais nova que a última publicada no GitHub (v{latest}).")
+                            } else {
+                                format!("Você já está na versão mais nova (v{cur}).")
+                            }));
                         });
                     }
                     Phase::Available(r) => {
