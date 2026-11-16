@@ -8,7 +8,7 @@ ffmpeg-python==0.2.0
 
 # Driver do PostgreSQL usado no deploy. Local continua em SQLite, que é nativo
 # do Python — instalar aqui não muda nada em quem roda na própria máquina.
-psycopg[binary]==3.2.3
+psycopg[binary]==3.2.13
 
 # Migrações de schema. Necessário para acrescentar as tabelas de usuários sem
 # recriar o banco nem editar tabela na mão.

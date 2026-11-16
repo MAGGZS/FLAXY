@@ -7,7 +7,7 @@ use eframe::egui::{self, text::LayoutJob, Align2, Color32, CornerRadius, Rect, R
 use crate::app::{Page, Shared};
 use crate::backend::{self, Res, Task};
 use crate::icons as ic;
-use crate::prospect::{self, Cat, Results, Source, Video};
+use crate::prospect::{self, Cat, Period, Results, Source, Video, REGIONS};
 use crate::theme::*;
 use crate::widgets::{self as w, Kind};
 
@@ -24,6 +24,42 @@ pub struct Prospeccao {
     t_save: Option<Task<Res<String>>>,
     key_open: bool,
     thumbs: crate::youtube::ThumbCache,
+    /// Código do país (vazio = Brasil) e janela de publicação. Ficam salvos.
+    region: String,
+    period: Period,
+    /// Mostrar vídeos de qualquer idioma (desligado = só no idioma do país).
+    any_lang: bool,
+    t_filters: Option<Task<Filters>>,
+    filters_loaded: bool,
+    t_filters_save: Option<Task<()>>,
+}
+
+#[derive(Clone)]
+struct Filters {
+    region: String,
+    period: Period,
+    any_lang: bool,
+}
+
+async fn load_filters(db: sqlx::SqlitePool) -> Filters {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = 'prospect_filters'").fetch_optional(&db).await.ok().flatten();
+    let v = row.and_then(|r| serde_json::from_str::<serde_json::Value>(&r.0).ok()).unwrap_or_default();
+    Filters {
+        region: v["region"].as_str().unwrap_or_default().to_string(),
+        period: Period::from_id(v["period"].as_str().unwrap_or_default()),
+        any_lang: v["any_lang"].as_bool().unwrap_or(false),
+    }
+}
+
+async fn save_filters(db: sqlx::SqlitePool, f: Filters) {
+    let v = serde_json::json!({ "region": f.region, "period": f.period.id(), "any_lang": f.any_lang }).to_string();
+    let r = sqlx::query("INSERT INTO settings (key, value) VALUES ('prospect_filters', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .bind(v)
+        .execute(&db)
+        .await;
+    if let Err(e) = r {
+        tracing::warn!("prospecção: não salvou os filtros: {e}");
+    }
 }
 
 const ROW_H: f32 = 112.0;
@@ -66,7 +102,7 @@ impl Prospeccao {
         }
         self.searching = q.clone();
         let key = Some(self.key_saved.clone()).filter(|k| !k.is_empty());
-        self.t_search = Some(sh.bk.spawn(ui.ctx(), prospect::search(q, key)));
+        self.t_search = Some(sh.bk.spawn(ui.ctx(), prospect::search(q, key, prospect::region(&self.region), self.period, !self.any_lang, Some(sh.bk.db.clone()))));
     }
 
     pub fn ui(&mut self, ui: &mut Ui, sh: &mut Shared) {
@@ -84,6 +120,17 @@ impl Prospeccao {
         if let Some(k) = self.t_key.as_ref().and_then(|t| t.take()) {
             self.key = k.clone();
             self.key_saved = k;
+        }
+        // Região e período salvos: lidos uma vez do banco.
+        if !self.filters_loaded && self.t_filters.is_none() {
+            self.t_filters = Some(sh.bk.spawn(ui.ctx(), load_filters(sh.bk.db.clone())));
+        }
+        if let Some(f) = self.t_filters.as_ref().and_then(|t| t.take()) {
+            self.t_filters = None;
+            self.filters_loaded = true;
+            self.region = f.region;
+            self.period = f.period;
+            self.any_lang = f.any_lang;
         }
         if let Some(r) = self.t_save.as_ref().and_then(|t| t.take()) {
             self.t_save = None;
@@ -117,7 +164,7 @@ impl Prospeccao {
 
         let has_key = !self.key_saved.is_empty();
         let mut toggle_key = false;
-        w::page_head(ui, "Prospecção", "Os vídeos mais vistos dos últimos 7 dias no YouTube sobre um assunto", |ui| {
+        w::page_head(ui, "Prospecção", "Os vídeos mais vistos no YouTube sobre um assunto, por país e período", |ui| {
             if w::button(ui, Kind::Ghost, Some(ic::KEY_ROUND), if has_key { "API do YouTube ligada" } else { "Chave da API" }).clicked() {
                 toggle_key = true;
             }
@@ -154,7 +201,7 @@ impl Prospeccao {
         let Some(res) = self.results.take() else {
             w::card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                w::empty(ui, ic::TELESCOPE, "Pesquise um assunto para ver o ranking da semana");
+                w::empty(ui, ic::TELESCOPE, "Pesquise um assunto para ver o ranking dos mais vistos");
             });
             return;
         };
@@ -165,6 +212,7 @@ impl Prospeccao {
     fn search_card(&mut self, ui: &mut Ui, sh: &mut Shared) {
         let busy = self.t_search.is_some();
         let mut go = false;
+        let mut filters_changed = false;
         w::card_frame().show(ui, |ui| {
             w::pad(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -200,8 +248,44 @@ impl Prospeccao {
                         }
                     });
                 });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(w::muted("Região"));
+                    let cur = prospect::region(&self.region);
+                    egui::ComboBox::from_id_salt("pros-region").width(170.0).selected_text(cur.name).show_ui(ui, |ui| {
+                        for r in &REGIONS {
+                            if ui.selectable_label(std::ptr::eq(r, cur), r.name).clicked() && !std::ptr::eq(r, cur) {
+                                self.region = r.code.to_string();
+                                filters_changed = true;
+                            }
+                        }
+                    });
+                    let only = !self.any_lang;
+                    let tip = "Mostra só vídeos de canais que informam esse país no YouTube. Canal sem país conta pelo idioma do título. Desligue para ver os de fora também";
+                    if w::check(ui, only, 18.0).on_hover_text(tip).clicked() {
+                        self.any_lang = only;
+                        filters_changed = true;
+                    }
+                    if ui.add(egui::Label::new(w::dim(format!("Só canais {}", cur.of))).sense(Sense::click())).on_hover_text(tip).clicked() {
+                        self.any_lang = only;
+                        filters_changed = true;
+                    }
+                    ui.add_space(16.0);
+                    ui.label(w::muted("Período"));
+                    let opts: Vec<(Period, &str)> = Period::ALL.iter().map(|p| (*p, p.label())).collect();
+                    filters_changed |= w::seg(ui, &mut self.period, &opts);
+                });
             });
         });
+        if filters_changed {
+            let f = Filters { region: self.region.clone(), period: self.period, any_lang: self.any_lang };
+            self.t_filters_save = Some(sh.bk.spawn(ui.ctx(), save_filters(sh.bk.db.clone(), f)));
+            // Com uma busca na tela, refaz com os filtros novos.
+            if self.results.is_some() {
+                go = true;
+            }
+        }
         if go {
             self.start(ui, sh);
         }
@@ -244,11 +328,15 @@ impl Prospeccao {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let src = match res.source {
                     Source::Api => "YouTube Data API",
-                    Source::YtDlp => "YouTube via yt-dlp",
+                    Source::YtDlp => "YouTube",
                 };
-                ui.label(w::mono_text(format!("{src} · últimos 7 dias · {}", res.at.format("%H:%M")), T_META, TEXT_3));
+                ui.label(w::mono_text(format!("{src} · {} · {} · {}", res.region.name, res.period.label().to_lowercase(), res.at.format("%H:%M")), T_META, TEXT_3));
             });
         });
+        if !res.related.is_empty() {
+            ui.add_space(8.0);
+            ui.label(w::muted(format!("Também buscado, temas próximos sugeridos pela IA: {}", res.related.join(", "))));
+        }
         ui.add_space(16.0);
 
         let avail = ui.available_width();
@@ -274,10 +362,11 @@ impl Prospeccao {
         w::card(ui, &title, &meta, |_| {}, |ui| {
             if list.is_empty() {
                 let msg = match self.cat {
-                    Cat::Shorts if res.source == Source::YtDlp => "Nenhum short apareceu na busca. Com a chave da API a lista de shorts fica completa",
-                    _ => "Nada desta categoria nos últimos 7 dias",
+                    Cat::Shorts if res.source == Source::YtDlp => "Nenhum short apareceu na busca. Com a chave da API a lista de shorts fica completa".to_string(),
+                    _ if res.local_only => format!("Nada de canais {} {}. Desmarque \"Só canais {}\" para ver os de fora", res.region.of, res.period.phrase(), res.region.of),
+                    _ => format!("Nada desta categoria {}", res.period.phrase()),
                 };
-                w::empty(ui, ic::SEARCH, msg);
+                w::empty(ui, ic::SEARCH, &msg);
                 return;
             }
             let top = list.first().map(|v| v.views).unwrap_or(1).max(1);
@@ -396,9 +485,9 @@ impl Prospeccao {
 
 fn news(ui: &mut Ui, res: &Results) {
     let meta = if res.news.is_empty() { String::new() } else { "Google Notícias".to_string() };
-    w::card(ui, "Notícias da semana", &meta, |_| {}, |ui| {
+    w::card(ui, "Notícias", &meta, |_| {}, |ui| {
         if res.news.is_empty() {
-            w::empty(ui, ic::NEWSPAPER, "Nenhuma notícia nos últimos 7 dias");
+            w::empty(ui, ic::NEWSPAPER, &format!("Nenhuma notícia {}", res.period.phrase()));
             return;
         }
         let width = ui.available_width();

@@ -1,0 +1,3 @@
+# sqlx stores a checksum of each migration's raw bytes: keep them LF on every
+# checkout so builds from different machines/settings produce the same checksum.
+crates/flaxy-core/migrations/*.sql text eol=lf

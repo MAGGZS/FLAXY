@@ -1252,6 +1252,17 @@ impl Clipes {
                 self.playing_clip = Some(id);
             }
         }
+        // Desenvolvimento: FLAXY_EDIT_CLIP=1 abre o editor do primeiro clipe uma vez.
+        let mark = mark.or_else(|| {
+            let id = egui::Id::unique("dev-edit-clip");
+            let done = ui.ctx().data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+            if done || std::env::var_os("FLAXY_EDIT_CLIP").is_none() || self.editing.is_some() {
+                return None;
+            }
+            let c = v.clips.first().filter(|c| self.drafts.contains_key(&c.row.id))?;
+            ui.ctx().data_mut(|d| d.insert_temp(id, true));
+            Some(c.row.id)
+        });
         if let Some(cid) = mark {
             if let (Some(d), Some(src), Some(c)) = (self.drafts.get(&cid), p.source_path.as_deref(), v.clips.iter().find(|c| c.row.id == cid)) {
                 if let Some(pl) = self.player.as_mut() {

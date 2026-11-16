@@ -108,6 +108,13 @@ impl Ia {
                             w::line(ui);
                         }
                         let on = s.transcriber == p.id;
+                        // Clique na linha inteira escolhe o provedor. Registrado ANTES do
+                        // conteúdo (com o retângulo do frame anterior) para ficar por baixo
+                        // do campo da chave; registrado depois, ele cobria o campo e o
+                        // TextEdit nunca recebia foco, então não dava para digitar nem colar.
+                        let row_id = egui::Id::unique(("prov", p.id));
+                        let row_rect = ui.ctx().data(|d| d.get_temp::<egui::Rect>(row_id));
+                        let row_clicked = row_rect.is_some_and(|r| ui.interact(r, row_id, Sense::click()).clicked());
                         let resp = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 12)).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.set_width(ui.available_width());
@@ -137,7 +144,8 @@ impl Ia {
                                 });
                             });
                         });
-                        if ui.interact(resp.response.rect, egui::Id::unique(("prov", p.id)), Sense::click()).clicked() && !on {
+                        ui.ctx().data_mut(|d| d.insert_temp(row_id, resp.response.rect));
+                        if row_clicked && !on {
                             s.transcriber = p.id.into();
                             changed = true;
                         }
@@ -177,7 +185,11 @@ impl Ia {
                             Some((id, name, placeholder, key)) => {
                                 ui.horizontal(|ui| {
                                     ui.vertical(|ui| {
-                                        w::label(ui, if *id == "anthropic" { "Modelo (vazio usa o padrão)" } else { "Modelo" });
+                                        w::label(ui, match *id {
+                                            "anthropic" => "Modelo (vazio usa o padrão)",
+                                            "groq" => "Modelo preferido (troca sozinho no limite)",
+                                            _ => "Modelo",
+                                        });
                                         changed |= ui.add(egui::TextEdit::singleline(&mut s.llm_model).hint_text(*placeholder).desired_width(260.0).font(mono(T_SEC))).changed();
                                     });
                                     ui.add_space(16.0);
@@ -192,6 +204,10 @@ impl Ia {
                                         }
                                     });
                                 });
+                                if *id == "groq" {
+                                    ui.add_space(8.0);
+                                    ui.add(egui::Label::new(w::muted("Cada modelo do Groq tem a sua cota grátis. Quando o preferido bate no limite, o FLAXY passa sozinho para outro modelo da sua chave e volta quando a cota dele renova. Pode deixar vazio")).wrap());
+                                }
                             }
                         }
                     });

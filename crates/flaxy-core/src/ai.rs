@@ -245,7 +245,15 @@ pub async fn transcribe(ctx: &TranscribeCtx<'_>, input: &Path) -> Result<Vec<Wor
     extract_audio(input, &audio, local).await?;
     let result = match s.transcriber.as_str() {
         "local" => local_whisper(ctx, &audio).await,
-        "groq" => openai_like(&audio, "https://api.groq.com/openai/v1", &s.keys.groq, "whisper-large-v3-turbo", &s.language).await,
+        // Rodízio: cada Whisper do Groq tem a sua cota grátis. Se o turbo bater
+        // no limite, o large-v3 transcreve.
+        "groq" => match openai_like(&audio, "https://api.groq.com/openai/v1", &s.keys.groq, "whisper-large-v3-turbo", &s.language).await {
+            Err(e) if e.to_string().contains(" 429 ") => {
+                tracing::warn!("Groq whisper-large-v3-turbo no limite, usando whisper-large-v3: {e}");
+                openai_like(&audio, "https://api.groq.com/openai/v1", &s.keys.groq, "whisper-large-v3", &s.language).await
+            }
+            r => r,
+        },
         "openai" => openai_like(&audio, "https://api.openai.com/v1", &s.keys.openai, "whisper-1", &s.language).await,
         "deepgram" => deepgram(&audio, &s.keys.deepgram, &s.language).await,
         "assemblyai" => assemblyai(&audio, &s.keys.assemblyai, &s.language).await,

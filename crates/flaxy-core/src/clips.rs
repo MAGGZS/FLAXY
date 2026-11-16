@@ -100,13 +100,67 @@ fn layout_id(l: &str) -> &'static str {
     LAYOUTS.iter().copied().find(|x| *x == l).unwrap_or("vertical_camera")
 }
 
+/// Onde uma área encaixada fica dentro do seu espaço: `x`/`y` de 0 (esquerda,
+/// topo) a 1 (direita, base), 0,5 = centro; `scale` 1 = o maior tamanho que
+/// cabe inteiro, menor encolhe.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Place {
+    #[serde(default = "half")]
+    pub x: f64,
+    #[serde(default = "half")]
+    pub y: f64,
+    #[serde(default = "one")]
+    pub scale: f64,
+}
+
+fn half() -> f64 {
+    0.5
+}
+fn one() -> f64 {
+    1.0
+}
+
+pub const PLACE_SCALE_MIN: f64 = 0.3;
+
+impl Default for Place {
+    fn default() -> Self {
+        Self::CENTER
+    }
+}
+
+impl Place {
+    pub const CENTER: Place = Place { x: 0.5, y: 0.5, scale: 1.0 };
+
+    pub fn clamped(self) -> Self {
+        let f = |v: f64, d: f64| if v.is_finite() { v } else { d };
+        Self { x: f(self.x, 0.5).clamp(0.0, 1.0), y: f(self.y, 0.5).clamp(0.0, 1.0), scale: f(self.scale, 1.0).clamp(PLACE_SCALE_MIN, 1.0) }
+    }
+
+    pub fn is_center(self) -> bool {
+        (self.x - 0.5).abs() < 1e-4 && (self.y - 0.5).abs() < 1e-4 && (self.scale - 1.0).abs() < 1e-4
+    }
+}
+
 /// Como cada área ocupa o seu espaço no clipe.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct AreaFit {
     /// true = encaixar: a área aparece inteira e a sobra é o próprio vídeo
     /// desfocado. false = preencher, cortando o que passar.
     pub camera: bool,
     pub screen: bool,
+    /// Posição e tamanho de cada área dentro do espaço, quando encaixada.
+    #[serde(default)]
+    pub cam_place: Place,
+    #[serde(default)]
+    pub scr_place: Place,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Places {
+    #[serde(default)]
+    camera: Place,
+    #[serde(default)]
+    screen: Place,
 }
 
 impl AreaFit {
@@ -115,7 +169,25 @@ impl AreaFit {
     }
 
     pub fn from_bits(b: i64) -> Self {
-        Self { camera: b & 1 != 0, screen: b & 2 != 0 }
+        Self { camera: b & 1 != 0, screen: b & 2 != 0, ..Default::default() }
+    }
+
+    /// Lê as posições gravadas na coluna `area_place` (JSON).
+    pub fn with_places(mut self, json: Option<&str>) -> Self {
+        if let Some(p) = json.and_then(|j| serde_json::from_str::<Places>(j).ok()) {
+            self.cam_place = p.camera.clamped();
+            self.scr_place = p.screen.clamped();
+        }
+        self
+    }
+
+    /// JSON das posições para a coluna `area_place` (None = as duas no centro).
+    pub fn places_json(self) -> Option<String> {
+        let (c, s) = (self.cam_place.clamped(), self.scr_place.clamped());
+        if c.is_center() && s.is_center() {
+            return None;
+        }
+        serde_json::to_string(&Places { camera: c, screen: s }).ok()
     }
 }
 
@@ -544,18 +616,34 @@ impl BgUse<'_> {
     }
 }
 
-/// Uma área recortada em W×H, de `[inp]` para `[out]`.
-fn box_chain(inp: &str, out: &str, r: Rect, fit: bool, w: i64, h: i64, bg: &mut BgUse) -> String {
+/// Expressão de posição do FFmpeg: `free` (a sobra, ex. `W-w`) vezes `f`.
+fn pos_expr(free: &str, f: f64) -> String {
+    if (f - 0.5).abs() < 1e-4 {
+        format!("({free})/2")
+    } else {
+        format!("({free})*{f:.4}")
+    }
+}
+
+/// Uma área recortada em W×H, de `[inp]` para `[out]`. Encaixada, fica onde
+/// `place` diz dentro do espaço.
+#[allow(clippy::too_many_arguments)]
+fn box_chain(inp: &str, out: &str, r: Rect, fit: bool, place: Place, w: i64, h: i64, bg: &mut BgUse) -> String {
     if !fit {
         return format!("[{inp}]{},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1[{out}]", r.crop());
     }
-    let fg = format!("[{out}f]scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2[{out}fg]");
-    let top = format!("[{out}bg][{out}fg]overlay=(W-w)/2:(H-h)/2,setsar=1[{out}]");
+    let place = place.clamped();
+    let even = |v: f64| ((v / 2.0).round() as i64 * 2).max(2);
+    let (fw, fh) = (even(w as f64 * place.scale), even(h as f64 * place.scale));
+    let fg = format!("[{out}f]scale={fw}:{fh}:force_original_aspect_ratio=decrease:force_divisible_by=2[{out}fg]");
+    let top = format!("[{out}bg][{out}fg]overlay={}:{},setsar=1[{out}]", pos_expr("W-w", place.x), pos_expr("H-h", place.y));
     let cover = format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}");
     match bg.bg {
         ClipBg::Black => format!(
-            "[{inp}]{},scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[{out}]",
-            r.crop()
+            "[{inp}]{},scale={fw}:{fh}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={w}:{h}:{}:{}:black,setsar=1[{out}]",
+            r.crop(),
+            pos_expr("ow-iw", place.x),
+            pos_expr("oh-ih", place.y)
         ),
         ClipBg::File(_) => {
             // O vídeo da área (esticado) só dá o ritmo dos quadros; o arquivo
@@ -588,19 +676,19 @@ fn layout_chain(layout: &str, inp: &str, out: &str, cam: Rect, scr: Rect, fit: A
         "vertical_split" => {
             // Tela em cima (`split` da altura), câmera embaixo.
             let (th, bh) = (sh, oh - sh);
-            let t = box_chain(&format!("{out}a"), &format!("{out}t"), scr, fit.screen, ow, th, bg);
-            let m = box_chain(&format!("{out}b"), &format!("{out}m"), cam, fit.camera, ow, bh, bg);
+            let t = box_chain(&format!("{out}a"), &format!("{out}t"), scr, fit.screen, fit.scr_place, ow, th, bg);
+            let m = box_chain(&format!("{out}b"), &format!("{out}m"), cam, fit.camera, fit.cam_place, ow, bh, bg);
             format!("[{inp}]split=2[{out}a][{out}b];{t};{m};[{out}t][{out}m]vstack=inputs=2[{out}]")
         }
         "vertical_split_cam" => {
             // Invertido: câmera em cima, tela embaixo.
             let (th, bh) = (oh - sh, sh);
-            let t = box_chain(&format!("{out}a"), &format!("{out}t"), cam, fit.camera, ow, th, bg);
-            let m = box_chain(&format!("{out}b"), &format!("{out}m"), scr, fit.screen, ow, bh, bg);
+            let t = box_chain(&format!("{out}a"), &format!("{out}t"), cam, fit.camera, fit.cam_place, ow, th, bg);
+            let m = box_chain(&format!("{out}b"), &format!("{out}m"), scr, fit.screen, fit.scr_place, ow, bh, bg);
             format!("[{inp}]split=2[{out}a][{out}b];{t};{m};[{out}t][{out}m]vstack=inputs=2[{out}]")
         }
         "horizontal" => format!("[{inp}]scale={ow}:{oh}:force_original_aspect_ratio=decrease,pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[{out}]"),
-        _ => box_chain(inp, out, cam, fit.camera, ow, oh, bg),
+        _ => box_chain(inp, out, cam, fit.camera, fit.cam_place, ow, oh, bg),
     }
 }
 
@@ -720,6 +808,9 @@ pub struct ClipRow {
     pub bg_mode: String,
     pub bg_path: Option<String>,
     pub watermark_id: Option<i64>,
+    /// Posição das áreas encaixadas (JSON de `Places`).
+    #[serde(skip)]
+    pub area_place: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1109,7 +1200,7 @@ impl Clips {
                     camera: parse_rect(&row.camera_rect, cam),
                     screen: parse_rect(&row.screen_rect, scr),
                     keys: parse_keys(&row.area_keys),
-                    fit: AreaFit::from_bits(row.area_fit),
+                    fit: AreaFit::from_bits(row.area_fit).with_places(row.area_place.as_deref()),
                     caption: parse_caption(&row.caption_adjust),
                     cap_keys: parse_cap_keys(&row.caption_keys),
                     word_edits: parse_json(&row.word_edits),
@@ -1335,7 +1426,7 @@ impl Clips {
             let cap_keys: Vec<CaptionKey> = e.cap_keys.iter().filter(|k| k.t.is_finite()).map(|k| CaptionKey { t: k.t.clamp(0.0, dur.max(0.0)), adjust: k.adjust.clone() }).collect();
             sqlx::query(
                 "UPDATE clip_items SET approved=?, layout=?, camera_rect=?, screen_rect=?, start=?, end=?, caption_style_id=?, \
-                 area_keys=?, area_fit=?, caption_adjust=?, caption_keys=?, split=?, word_edits=?, cuts=?, smooth=?, smooth_secs=?, smooth_curve=?, bg_mode=?, bg_path=?, watermark_id=?, \
+                 area_keys=?, area_fit=?, caption_adjust=?, caption_keys=?, split=?, word_edits=?, cuts=?, smooth=?, smooth_secs=?, smooth_curve=?, bg_mode=?, bg_path=?, watermark_id=?, area_place=?, \
                  status=CASE WHEN ? THEN 'queued' ELSE status END, progress=CASE WHEN ? THEN 0 ELSE progress END, \
                  error_msg=CASE WHEN ? THEN NULL ELSE error_msg END WHERE id=? AND project_id=?",
             )
@@ -1359,6 +1450,7 @@ impl Clips {
             .bind(bg.mode())
             .bind(bg.path().map(str::to_string))
             .bind(e.watermark_id)
+            .bind(e.fit.places_json())
             .bind(enqueue)
             .bind(enqueue)
             .bind(enqueue)
@@ -1468,7 +1560,7 @@ impl Clips {
             ClipBg::File(f) if !Path::new(&f).exists() => ClipBg::Blur,
             b => b,
         };
-        let mut graph = clip_graph_bg(&row.layout, &segments, AreaFit::from_bits(row.area_fit), row.split, ow, oh, &ass, len, &bg);
+        let mut graph = clip_graph_bg(&row.layout, &segments, AreaFit::from_bits(row.area_fit).with_places(row.area_place.as_deref()), row.split, ow, oh, &ass, len, &bg);
         // O grafo só lê a entrada 1 quando alguma área encaixa sobre o arquivo.
         let bg_input = bg.path().filter(|_| graph.starts_with("[1:v]")).map(str::to_string);
         // Com cortes, o áudio também perde os trechos cortados.
@@ -1769,14 +1861,14 @@ mod tests {
     fn print_bg_graph() {
         let segs = area_segments(0.0, 4.0, "vertical_split", A, Rect::FULL, &[k(2.0, B, Rect::FULL)]);
         let segs = smooth_segments(&segs, 0.8, Ease::PRESETS[6].2);
-        let fit = AreaFit { camera: true, screen: true };
+        let fit = AreaFit { camera: true, screen: true, ..Default::default() };
         println!("GRAPH {}", clip_graph_bg("vertical_split", &segs, fit, 0.5, 1080, 1920, "", 4.0, &ClipBg::File("x".into())));
     }
 
     #[test]
     fn fit_backgrounds() {
         let segs = area_segments(0.0, 10.0, "vertical_split", A, Rect::FULL, &[k(5.0, B, Rect::FULL)]);
-        let fit = AreaFit { camera: true, screen: true };
+        let fit = AreaFit { camera: true, screen: true, ..Default::default() };
         let blur = clip_graph_bg("vertical_split", &segs, fit, 0.5, 1080, 1920, "", 10.0, &ClipBg::Blur);
         assert!(blur.contains("boxblur=24:2") && !blur.contains("[1:v]"));
         let soft = clip_graph_bg("vertical_split", &segs, fit, 0.5, 1080, 1920, "", 10.0, &ClipBg::Soft);
@@ -1868,14 +1960,34 @@ mod tests {
     #[test]
     fn graph_concat_and_fit() {
         let segs = area_segments(0.0, 20.0, "vertical_split", A, Rect::FULL, &[k(10.0, B, Rect::FULL)]);
-        let g = clip_graph("vertical_split", &segs, AreaFit { camera: true, screen: false }, DEFAULT_SPLIT, 1080, 1920, ",ass=x.ass", 20.0);
+        let g = clip_graph("vertical_split", &segs, AreaFit { camera: true, screen: false, ..Default::default() }, DEFAULT_SPLIT, 1080, 1920, ",ass=x.ass", 20.0);
         assert!(g.contains("concat=n=2:v=1:a=0[v]"));
         assert!(g.contains("trim=start=10.000:end=20.000"));
         assert!(g.contains("boxblur"));
         assert!(g.ends_with("[v]null,ass=x.ass,format=yuv420p[out]"));
         let g1 = clip_graph("vertical_camera", &segs[..1], AreaFit::default(), DEFAULT_SPLIT, 1080, 1920, "", 10.0);
         assert!(!g1.contains("concat") && !g1.contains("boxblur"));
-        assert_eq!(AreaFit::from_bits(AreaFit { camera: true, screen: true }.bits()), AreaFit { camera: true, screen: true });
+        assert_eq!(AreaFit::from_bits(AreaFit { camera: true, screen: true, ..Default::default() }.bits()), AreaFit { camera: true, screen: true, ..Default::default() });
+    }
+
+    #[test]
+    fn fit_place_moves_and_scales() {
+        let segs = area_segments(0.0, 10.0, "vertical_camera", A, Rect::FULL, &[]);
+        let top = Place { x: 0.5, y: 0.0, scale: 0.5 };
+        let fit = AreaFit { camera: true, cam_place: top, ..Default::default() };
+        let g = clip_graph("vertical_camera", &segs, fit, DEFAULT_SPLIT, 1080, 1920, "", 10.0);
+        assert!(g.contains("scale=540:960:force_original_aspect_ratio=decrease"), "{g}");
+        assert!(g.contains("overlay=(W-w)/2:(H-h)*0.0000"), "{g}");
+        let black = clip_graph_bg("vertical_camera", &segs, fit, DEFAULT_SPLIT, 1080, 1920, "", 10.0, &ClipBg::Black);
+        assert!(black.contains("pad=1080:1920:(ow-iw)/2:(oh-ih)*0.0000:black"), "{black}");
+        // Centro continua com a expressão antiga.
+        let c = clip_graph("vertical_camera", &segs, AreaFit { camera: true, ..Default::default() }, DEFAULT_SPLIT, 1080, 1920, "", 10.0);
+        assert!(c.contains("overlay=(W-w)/2:(H-h)/2"));
+        // Gravação: centro não grava nada; o resto volta igual.
+        assert_eq!(AreaFit::default().places_json(), None);
+        let back = AreaFit::from_bits(fit.bits()).with_places(fit.places_json().as_deref());
+        assert_eq!(back, fit);
+        assert_eq!(Place { x: 9.0, y: f64::NAN, scale: 0.0 }.clamped(), Place { x: 1.0, y: 0.5, scale: PLACE_SCALE_MIN });
     }
 
     #[test]
@@ -1893,9 +2005,9 @@ mod tests {
         let mut split = k(3.0, B, A);
         split.layout = Some(Vertical::Split);
         let segs = area_segments(0.0, 6.0, "vertical_camera", A, Rect::FULL, &[split]);
-        println!("{}", clip_graph("vertical_camera", &segs, AreaFit { camera: true, screen: false }, DEFAULT_SPLIT, 1080, 1920, "", 6.0));
+        println!("{}", clip_graph("vertical_camera", &segs, AreaFit { camera: true, screen: false, ..Default::default() }, DEFAULT_SPLIT, 1080, 1920, "", 6.0));
         let segs = area_segments(0.0, 6.0, "vertical_split", A, Rect::FULL, &[k(3.0, B, A)]);
-        println!("{}", clip_graph("vertical_split", &segs, AreaFit { camera: true, screen: false }, DEFAULT_SPLIT, 1080, 1920, "", 6.0));
+        println!("{}", clip_graph("vertical_split", &segs, AreaFit { camera: true, screen: false, ..Default::default() }, DEFAULT_SPLIT, 1080, 1920, "", 6.0));
     }
 
     fn words() -> Vec<Word> {

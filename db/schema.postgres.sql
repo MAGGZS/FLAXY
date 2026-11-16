@@ -1,10 +1,10 @@
 -- =============================================================================
--- AutoEdit — Schema de usuários e domínio multiusuário
+-- FLAXY — Schema de usuários e domínio multiusuário
 -- Alvo: PostgreSQL 14+
 --
 -- Aplicar:
---   createdb autoedit
---   psql -d autoedit -f db/schema.postgres.sql
+--   createdb flaxy
+--   psql -d flaxy -f db/schema.postgres.sql
 --
 -- O arquivo é idempotente: pode ser reaplicado sem erro (IF NOT EXISTS em tudo
 -- que o Postgres permite). Ele NÃO apaga dados existentes.

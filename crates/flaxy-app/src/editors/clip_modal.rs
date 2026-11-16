@@ -12,7 +12,7 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, Pos2, Rect, Sense, Strok
 use flaxy_core::captions::{CaptionStyle, Word};
 use flaxy_core::watermarks::Watermark;
 use flaxy_core::clips::{
-    area_segments, caption_parts, kept_len, kept_ranges, pause_cuts, smooth_segments, AreaFit, ClipBg, Ease, EASE_Y_MAX, EASE_Y_MIN, SMOOTH_MAX, SMOOTH_MIN, SMOOTH_SECS, AreaKey, CaptionAdjust, CaptionKey, Cut, Rect as FRect, Vertical, WordEdit,
+    area_segments, caption_parts, kept_len, kept_ranges, pause_cuts, smooth_segments, AreaFit, ClipBg, Ease, Place, EASE_Y_MAX, EASE_Y_MIN, PLACE_SCALE_MIN, SMOOTH_MAX, SMOOTH_MIN, SMOOTH_SECS, AreaKey, CaptionAdjust, CaptionKey, Cut, Rect as FRect, Vertical, WordEdit,
 };
 
 use crate::editors::caption_preview;
@@ -92,8 +92,133 @@ struct BoxDef {
     slot: f32,
 }
 
-/// Largura da coluna de ferramentas à esquerda do quadro.
-const SIDE_W: f32 = 330.0;
+/// Trilho de ferramentas, painel da ferramenta e largura útil dentro dele.
+const RAIL_W: f32 = 76.0;
+const INSP_W: f32 = 332.0;
+const SIDE_W: f32 = INSP_W - 40.0;
+/// Coluna dos nomes das faixas da linha do tempo.
+const GUTTER: f32 = 76.0;
+/// Amarelo das marcas de edição (início/fim, travas, pontos da curva).
+const MARK: Color32 = Color32::from_rgb(240, 190, 60);
+
+/// Ferramenta aberta no painel da esquerda.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tab {
+    Frame,
+    Motion,
+    Trim,
+    Caption,
+    Text,
+    Mark,
+}
+
+const TABS: [(Tab, &str, &str); 6] = [
+    (Tab::Frame, ic::CROP, "Enquadrar"),
+    (Tab::Motion, ic::LAYERS, "Trocas"),
+    (Tab::Trim, ic::SCISSORS, "Trecho"),
+    (Tab::Caption, ic::CAPTIONS, "Legenda"),
+    (Tab::Text, ic::TYPE, "Texto"),
+    (Tab::Mark, ic::IMAGE, "Marca"),
+];
+
+impl Tab {
+    fn head(self) -> (&'static str, &'static str) {
+        match self {
+            Tab::Frame => ("Enquadrar", "Que parte do vídeo entra em cada espaço do clipe e onde ela fica"),
+            Tab::Motion => ("Trocas de área", "Mude o enquadramento ao longo do clipe, com corte seco ou deslizando"),
+            Tab::Trim => ("Trecho", "Início, fim e o que sai de dentro do clipe"),
+            Tab::Caption => ("Legenda", "Lugar e tamanho da legenda só neste clipe"),
+            Tab::Text => ("Texto da legenda", "Corrija ou apague palavras que a transcrição errou"),
+            Tab::Mark => ("Marca d'água", "Textos translúcidos por cima do clipe"),
+        }
+    }
+}
+
+/// Espaço de cada área no quadro de saída `out`.
+fn out_slots(out: Rect, layout: &str, split: f64) -> Vec<(Key, Rect)> {
+    let split = split.clamp(0.2, 0.8) as f32;
+    let cut = |y: f32| (Rect::from_min_max(out.min, egui::pos2(out.right(), y)), Rect::from_min_max(egui::pos2(out.left(), y), out.max));
+    match layout {
+        "vertical_split" => {
+            let (a, b) = cut(out.top() + out.height() * split);
+            vec![(Key::Screen, a), (Key::Camera, b)]
+        }
+        "vertical_split_cam" => {
+            let (a, b) = cut(out.top() + out.height() * (1.0 - split));
+            vec![(Key::Camera, a), (Key::Screen, b)]
+        }
+        "horizontal" => vec![],
+        _ => vec![(Key::Camera, out)],
+    }
+}
+
+/// Onde uma área encaixada de proporção `a` fica dentro de `dst` (igual ao
+/// scale + overlay do corte).
+fn placed_rect(dst: Rect, a: f32, p: Place) -> Rect {
+    let full = fit_rect(dst, a);
+    let size = full.size() * p.scale.clamp(PLACE_SCALE_MIN, 1.0) as f32;
+    let free = dst.size() - size;
+    Rect::from_min_size(dst.min + egui::vec2(free.x * p.x as f32, free.y * p.y as f32), size)
+}
+
+/// Proporção (largura/altura na tela) de um recorte `r` de uma fonte `src`.
+fn area_aspect(r: FRect, src: f32) -> f32 {
+    (r.w as f32 * src) / (r.h as f32).max(0.0001)
+}
+
+/// Grade 3×3 que escolhe o canto, a borda ou o centro do espaço.
+fn anchor_pad(ui: &mut Ui, p: &mut Place) -> bool {
+    let cell = 24.0;
+    let (outer, _) = ui.allocate_exact_size(egui::vec2(cell * 3.0 + 8.0, cell * 3.0 + 8.0), Sense::hover());
+    ui.painter().rect(outer, CornerRadius::same(R), BG_DEEP, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    let mut changed = false;
+    for row in 0..3 {
+        for col in 0..3 {
+            let (fx, fy) = (col as f64 / 2.0, row as f64 / 2.0);
+            let r = Rect::from_min_size(outer.min + egui::vec2(4.0 + col as f32 * cell, 4.0 + row as f32 * cell), egui::vec2(cell, cell));
+            let resp = ui.interact(r, ui.auto_id_with(("anchor", row, col)), Sense::click());
+            let on = (p.x - fx).abs() < 0.01 && (p.y - fy).abs() < 0.01;
+            if resp.hovered() {
+                ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(4), RAISED);
+            }
+            if on {
+                ui.painter().rect_filled(Rect::from_center_size(r.center(), egui::vec2(10.0, 10.0)), CornerRadius::same(2), ACCENT);
+            } else {
+                ui.painter().circle_filled(r.center(), 2.0, if resp.hovered() { TEXT_2 } else { TEXT_3 });
+            }
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on {
+                (p.x, p.y) = (fx, fy);
+                changed = true;
+            }
+        }
+    }
+    // Posição livre (arrastada na prévia): marca onde a área está.
+    let free = !(0..3).any(|i| (p.x - i as f64 / 2.0).abs() < 0.01) || !(0..3).any(|i| (p.y - i as f64 / 2.0).abs() < 0.01);
+    if free {
+        let c = outer.min + egui::vec2(4.0 + cell / 2.0 + p.x as f32 * cell * 2.0, 4.0 + cell / 2.0 + p.y as f32 * cell * 2.0);
+        ui.painter().circle_stroke(c, 5.0, Stroke::new(1.5, ACCENT_INK));
+    }
+    changed
+}
+
+/// Nome de uma faixa da linha do tempo, na coluna da esquerda.
+fn track_label(ui: &mut Ui, h: f32, text: &str) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(GUTTER, h), Sense::hover());
+    ui.painter().text(r.left_center(), Align2::LEFT_CENTER, text, body(T_META), TEXT_3);
+}
+
+/// Título de um grupo dentro do painel.
+fn group(ui: &mut Ui, title: &str) {
+    ui.label(egui::RichText::new(title).font(strong(T_SEC)).color(TEXT));
+    ui.add_space(8.0);
+}
+
+/// Separador entre grupos do painel.
+fn gap(ui: &mut Ui) {
+    ui.add_space(12.0);
+    w::line(ui);
+    ui.add_space(12.0);
+}
 
 /// Espaços de cada área na saída 1080×1920; `split` = parte da tela.
 fn boxes(layout: &str, split: f64) -> Vec<BoxDef> {
@@ -168,6 +293,11 @@ fn snap_id() -> egui::Id {
     egui::Id::unique("clip-modal-snap")
 }
 
+/// Lembra a ferramenta aberta entre uma abertura e outra.
+fn tab_id() -> egui::Id {
+    egui::Id::unique("clip-modal-tab")
+}
+
 pub enum Outcome {
     Open,
     Save(Edit),
@@ -222,6 +352,11 @@ pub struct ClipModal {
     /// Ponto de controle da curva sendo arrastado (0 = primeiro, 1 = segundo).
     curve_drag: Option<usize>,
     bg_tex: Option<egui::TextureHandle>,
+    tab: Tab,
+    /// Área encaixada sendo arrastada na prévia: qual, retângulo no começo, ponto de partida.
+    place_drag: Option<(Key, Rect, Pos2)>,
+    /// Travas em uso no arraste da prévia (x, y), já em px da tela.
+    place_guides: (Option<f32>, Option<f32>),
 }
 
 impl ClipModal {
@@ -260,7 +395,19 @@ impl ClipModal {
             watermarks: i.watermarks,
             curve_drag: None,
             bg_tex: None,
+            tab: Tab::Frame,
+            place_drag: None,
+            place_guides: (None, None),
         }
+    }
+
+    fn place_of(&self, k: Key) -> Place {
+        if k == Key::Camera { self.s.fit.cam_place } else { self.s.fit.scr_place }
+    }
+
+    fn set_place(&mut self, k: Key, p: Place) {
+        let p = p.clamped();
+        if k == Key::Camera { self.s.fit.cam_place = p } else { self.s.fit.scr_place = p }
     }
 
     /// Instante da agulha, preso ao clipe (para editar áreas e legenda).
@@ -626,8 +773,12 @@ impl ClipModal {
     pub fn show(&mut self, ctx: &egui::Context, fonts: &[String], bg_tex: Option<egui::TextureHandle>) -> Outcome {
         self.bg_tex = bg_tex;
         self.snap = ctx.data(|d| d.get_temp::<bool>(snap_id())).unwrap_or(self.snap);
+        self.tab = ctx.data(|d| d.get_temp::<Tab>(tab_id())).unwrap_or(self.tab);
         let out = self.show_inner(ctx, fonts);
-        ctx.data_mut(|d| d.insert_temp(snap_id(), self.snap));
+        ctx.data_mut(|d| {
+            d.insert_temp(snap_id(), self.snap);
+            d.insert_temp(tab_id(), self.tab);
+        });
         out
     }
 
@@ -663,94 +814,82 @@ impl ClipModal {
         let meta = format!("{} → {} · {}s", timecode(self.s.start, false), timecode(self.s.end, false), final_len.round());
         let title = format!("Editar clipe · {}", self.title);
         let screen_h = ctx.content_rect().height();
-        let (open, _) = w::modal(ctx, "clip-modal", &title, &meta, 1560.0, |ui| {
-            // Tudo rola menos o rodapé (Salvar/Cancelar), para caber em telas baixas.
-            let body_h = (screen_h - 48.0 - 56.0 - 80.0).max(240.0);
-            egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, true]).show(ui, |ui| {
-                w::pad(ui, |ui| {
-                    let h = (screen_h * 0.46).clamp(300.0, 500.0);
-                    let prev_w = (h * 9.0 / 16.0).round();
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 16.0;
-                        // Ferramentas das áreas à esquerda, sempre à mão ao lado do quadro.
-                        ui.allocate_ui_with_layout(egui::vec2(SIDE_W, h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.set_width(SIDE_W);
-                            egui::ScrollArea::vertical().id_salt("clip-modal-tools").max_height(h).auto_shrink([false, false]).show(ui, |ui| {
-                                ui.set_width(SIDE_W - 8.0);
-                                self.areas_panel(ui);
-                            });
-                        });
-                        let stage_w = (ui.available_width() - prev_w - 16.0).max(320.0);
-                        if self.stage(ui, stage_w, h) {
-                            toggle = true;
-                        }
-                        self.preview(ui, prev_w, h, fonts);
-                    });
-                    ui.add_space(10.0);
-                    // Controles + linha do tempo do clipe.
+        let (open, _) = w::modal(ctx, "clip-modal", &title, &meta, 1640.0, |ui| {
+            // Alturas fixas: cabeçalho 57, rodapé 57, parte de baixo (controles
+            // + faixas); o resto vai para a área de trabalho.
+            let tracks_h = 20.0 + 4.0 + 52.0 + if self.style.is_some() { 4.0 + 26.0 } else { 0.0 };
+            let lower_h = 12.0 + 32.0 + 8.0 + tracks_h + 16.0;
+            let body_h = (screen_h - 48.0 - 57.0 - 58.0).max(320.0);
+            let work_h = (body_h - lower_h - 2.0).clamp(320.0, 820.0);
+            egui::ScrollArea::vertical().id_salt("clip-modal-body").max_height(body_h).auto_shrink([false, true]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    self.rail(ui, work_h);
+                    let (sep, _) = ui.allocate_exact_size(egui::vec2(1.0, work_h), Sense::hover());
+                    ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, LINE));
+                    self.inspector(ui, work_h);
+                    let (sep, _) = ui.allocate_exact_size(egui::vec2(1.0, work_h), Sense::hover());
+                    ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, LINE));
+                    if self.viewer(ui, work_h, fonts) {
+                        toggle = true;
+                    }
+                });
+                w::line(ui);
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 16 }).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    if self.transport(ui, final_len) {
+                        toggle = true;
+                    }
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let playing = self.player.is_playing();
-                        if w::icon_button(ui, if playing { ic::PAUSE } else { ic::PLAY }, if playing { "Pausar (espaço)" } else { "Reproduzir (espaço)" }).clicked() {
-                            toggle = true;
-                        }
-                        let rel = self.now() - self.s.start;
-                        ui.label(w::mono_text(format!("{} / {}", timecode(rel, true), timecode(self.s.end - self.s.start, true)), T_META, TEXT_2));
-                        if final_len < self.s.end - self.s.start - 0.05 {
-                            ui.label(w::mono_text(format!("· final {} sem os cortes", timecode(final_len, false)), T_META, TEXT_3));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.add_enabled_ui(!self.redo.is_empty(), |ui| {
-                                if w::button(ui, Kind::Ghost, None, "Refazer").on_hover_text("Ctrl+Y").clicked() {
-                                    self.do_redo();
-                                }
-                            });
-                            ui.add_enabled_ui(!self.undo.is_empty() || self.s != self.committed, |ui| {
-                                if w::button(ui, Kind::Ghost, Some(ic::ROTATE_CCW), "Desfazer").on_hover_text("Ctrl+Z").clicked() {
-                                    self.do_undo();
-                                }
-                            });
-                        });
+                        ui.add_space(GUTTER);
+                        self.ruler(ui);
                     });
-                    ui.add_space(6.0);
-                    self.timeline(ui);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        track_label(ui, 52.0, "Áreas");
+                        self.timeline(ui);
+                    });
                     if self.style.is_some() {
                         ui.add_space(4.0);
-                        self.cap_strip(ui);
+                        ui.horizontal(|ui| {
+                            track_label(ui, 26.0, "Legenda");
+                            self.cap_strip(ui);
+                        });
                     }
-                    if toggle {
-                        if self.player.is_playing() {
-                            self.player.pause();
-                        } else {
-                            if self.player.pos >= self.s.end - 0.1 || self.player.pos < self.s.start {
-                                self.player.seek(self.s.start);
-                            }
-                            self.player.stop_at = Some(self.s.end);
-                            self.player.play();
-                        }
-                    }
-                    ui.add_space(14.0);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 28.0;
-                        let col = (ui.available_width() - 56.0) / 3.0;
-                        w::column(ui, col, |ui| self.trim_panel(ui));
-                        w::column(ui, col, |ui| self.caption_panel(ui));
-                        w::column(ui, col, |ui| self.text_panel(ui));
-                    });
-                    ui.add_space(8.0);
                 });
             });
+            if toggle {
+                if self.player.is_playing() {
+                    self.player.pause();
+                } else {
+                    if self.player.pos >= self.s.end - 0.1 || self.player.pos < self.s.start {
+                        self.player.seek(self.s.start);
+                    }
+                    self.player.stop_at = Some(self.s.end);
+                    self.player.play();
+                }
+            }
             w::line(ui);
-            w::pad(ui, |ui| {
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(w::muted("Atalhos: espaço tocar · ←/→ quadro · Shift+←/→ 1 s · I/O início/fim · C corte · N troca · Del remover troca · T travas · Ctrl+Z/Y"));
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (k, what) in [("Espaço", "tocar"), ("I", "início"), ("O", "fim"), ("C", "corte"), ("N", "troca"), ("T", "travas")] {
+                        w::keycap(ui, k);
+                        ui.label(w::muted(what));
+                        ui.add_space(6.0);
+                    }
+                    ui.label(w::muted("· mais atalhos")).on_hover_text("←/→ um quadro · Shift+←/→ um segundo · Del remove a troca · Alt solta a trava no arraste · Ctrl+Z desfaz · Ctrl+Y refaz");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         if w::button(ui, Kind::Primary, Some(ic::CHECK), "Salvar").clicked() {
                             out = Outcome::Save(self.s.clone());
                         }
                         if w::button(ui, Kind::Default, None, "Salvar e aplicar aos outros")
-                            .on_hover_text("Copia o modo, as áreas, a divisão, o encaixe, o deslize e a posição da legenda para os outros clipes deste vídeo. Início, fim, trocas, cortes e texto continuam só neste")
+                            .on_hover_text("Copia o modo, as áreas, a divisão, o encaixe com a posição, o deslize e a posição da legenda para os outros clipes deste vídeo. Início, fim, trocas, cortes e texto continuam só neste")
                             .clicked()
                         {
                             out = Outcome::SaveAll(self.s.clone());
@@ -770,6 +909,186 @@ impl ClipModal {
             return Outcome::Close;
         }
         out
+    }
+
+    /// Trilho de ferramentas à esquerda: ícone em cima, nome embaixo.
+    fn rail(&mut self, ui: &mut Ui, h: f32) {
+        ui.allocate_ui_with_layout(egui::vec2(RAIL_W, h), egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.set_width(RAIL_W);
+            ui.set_min_height(h);
+            ui.add_space(8.0);
+            for (tab, icon, name) in TABS {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(RAIL_W - 16.0, 56.0), Sense::click());
+                let on = self.tab == tab;
+                let p = ui.painter();
+                if on {
+                    p.rect_filled(r, CornerRadius::same(R), RAISED_2);
+                    p.hline(r.x_range().shrink(R as f32), r.top() + 1.0, Stroke::new(1.0, HIGHLIGHT));
+                } else if resp.hovered() {
+                    p.rect_filled(r, CornerRadius::same(R), RAISED);
+                }
+                let (ic_c, tx_c) = if on { (TEXT, TEXT) } else if resp.hovered() { (TEXT_2, TEXT_2) } else { (TEXT_3, TEXT_2) };
+                p.text(r.center_top() + egui::vec2(0.0, 18.0), Align2::CENTER_CENTER, icon, body(ICON), ic_c);
+                p.text(r.center_top() + egui::vec2(0.0, 40.0), Align2::CENTER_CENTER, name, body(T_META), tx_c);
+                // Ponto quando a ferramenta tem algo ligado neste clipe.
+                let busy = match tab {
+                    Tab::Motion => !self.s.keys.is_empty(),
+                    Tab::Trim => !self.s.cuts.is_empty(),
+                    Tab::Caption => self.s.caption.is_some() || !self.s.cap_keys.is_empty(),
+                    Tab::Text => !self.s.word_edits.is_empty(),
+                    Tab::Mark => self.s.watermark_id.is_some(),
+                    Tab::Frame => false,
+                };
+                if busy {
+                    p.circle_filled(r.right_top() + egui::vec2(-10.0, 10.0), 3.0, ACCENT_INK);
+                }
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.tab = tab;
+                }
+                ui.add_space(4.0);
+            }
+        });
+    }
+
+    /// Painel da ferramenta aberta.
+    fn inspector(&mut self, ui: &mut Ui, h: f32) {
+        ui.allocate_ui_with_layout(egui::vec2(INSP_W, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(INSP_W);
+            ui.set_min_height(h);
+            egui::ScrollArea::vertical().id_salt("clip-modal-insp").max_height(h).auto_shrink([false, false]).show(ui, |ui| {
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 20, right: 20, top: 16, bottom: 20 }).show(ui, |ui| {
+                    ui.set_width(SIDE_W);
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                    let (title, sub) = self.tab.head();
+                    ui.label(egui::RichText::new(title).font(strong(T_BODY)).color(TEXT));
+                    ui.add(egui::Label::new(w::muted(sub)).wrap());
+                    ui.add_space(16.0);
+                    match self.tab {
+                        Tab::Frame => self.frame_panel(ui),
+                        Tab::Motion => self.motion_panel(ui),
+                        Tab::Trim => self.trim_panel(ui),
+                        Tab::Caption => self.caption_panel(ui),
+                        Tab::Text => self.text_panel(ui, h - 120.0),
+                        Tab::Mark => self.mark_panel(ui),
+                    }
+                });
+            });
+        });
+    }
+
+    /// Monitores: fonte com as áreas e saída 9:16. Devolve true num clique na fonte.
+    fn viewer(&mut self, ui: &mut Ui, h: f32, fonts: &[String]) -> bool {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::hover());
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, BG_DEEP);
+        let inner = rect.shrink2(egui::vec2(20.0, 16.0));
+        let mh = inner.height() - 24.0;
+        let prev_w = (mh * 9.0 / 16.0).round();
+        let stage_w = (inner.width() - prev_w - 20.0).max(240.0);
+        let mut clicked = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Min)), |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(20.0, 0.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.allocate_ui_with_layout(egui::vec2(stage_w, 24.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.label(w::mono_text("Fonte", T_META, TEXT_3));
+                    if self.cut_at(self.player.pos).is_some() {
+                        ui.label(w::mono_text("· trecho cortado, não entra no clipe", T_META, ERR));
+                    }
+                });
+                clicked = self.stage(ui, stage_w, mh);
+            });
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.allocate_ui_with_layout(egui::vec2(prev_w, 24.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.label(w::mono_text("Saída 9:16", T_META, TEXT_3));
+                });
+                self.preview(ui, prev_w, mh, fonts);
+            });
+        });
+        clicked
+    }
+
+    /// Tocar, tempo, travas e desfazer. Devolve true se pediu tocar/pausar.
+    fn transport(&mut self, ui: &mut Ui, final_len: f64) -> bool {
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            ui.set_height(32.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let playing = self.player.is_playing();
+            if w::button_sized(ui, Kind::Default, Some(if playing { ic::PAUSE } else { ic::PLAY }), "", 32.0).on_hover_text(if playing { "Pausar (espaço)" } else { "Tocar (espaço)" }).clicked() {
+                toggle = true;
+            }
+            ui.add_space(4.0);
+            let rel = self.now() - self.s.start;
+            ui.label(w::mono_text(timecode(rel, true), T_BODY, TEXT));
+            ui.label(w::mono_text(format!("/ {}", timecode(self.s.end - self.s.start, true)), T_BODY, TEXT_3));
+            if final_len < self.s.end - self.s.start - 0.05 {
+                ui.label(w::mono_text(format!("· final {} sem os cortes", timecode(final_len, false)), T_META, TEXT_3));
+            }
+            if let Some(a) = self.cut_mark {
+                ui.label(w::mono_text(format!("· corte desde {}", timecode(a - self.s.start, false)), T_META, MARK));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add_enabled_ui(!self.redo.is_empty(), |ui| {
+                    if w::button(ui, Kind::Ghost, None, "Refazer").on_hover_text("Ctrl+Y").clicked() {
+                        self.do_redo();
+                    }
+                });
+                ui.add_enabled_ui(!self.undo.is_empty() || self.s != self.committed, |ui| {
+                    if w::button(ui, Kind::Ghost, Some(ic::ROTATE_CCW), "Desfazer").on_hover_text("Ctrl+Z").clicked() {
+                        self.do_undo();
+                    }
+                });
+                ui.add_space(8.0);
+                let (icon, label) = if self.snap { (ic::LOCK, "Travas no centro") } else { (ic::LOCK_OPEN, "Travas desligadas") };
+                if w::button(ui, Kind::Ghost, Some(icon), label)
+                    .on_hover_text("As áreas grudam no centro e nas bordas ao mover ou esticar. Segure Alt para soltar na hora (T)")
+                    .clicked()
+                {
+                    self.snap = !self.snap;
+                }
+            });
+        });
+        toggle
+    }
+
+    /// Régua de tempo em cima das faixas (segundos a partir do início do clipe).
+    fn ruler(&mut self, ui: &mut Ui) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), Sense::click_and_drag());
+        let inner = rect.shrink2(egui::vec2(10.0, 0.0));
+        let p = ui.painter_at(rect);
+        let (v0, v1) = self.view;
+        let px_s = inner.width() as f64 / (v1 - v0).max(0.001);
+        let step = [0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0].into_iter().find(|s| s * px_s >= 64.0).unwrap_or(300.0);
+        let first = ((v0 - self.s.start) / step).floor() as i64;
+        let last = ((v1 - self.s.start) / step).ceil() as i64;
+        for i in first..=last {
+            let rel = i as f64 * step;
+            let t = self.s.start + rel;
+            if t < v0 - 1e-6 || t > v1 + 1e-6 {
+                continue;
+            }
+            let x = self.tx(inner, t);
+            p.vline(x, rect.bottom() - 6.0..=rect.bottom(), Stroke::new(1.0, LINE_2));
+            let half = self.tx(inner, t + step / 2.0);
+            if t + step / 2.0 <= v1 {
+                p.vline(half, rect.bottom() - 3.0..=rect.bottom(), Stroke::new(1.0, LINE_2));
+            }
+            let a = rel.abs();
+            let label = if a < 60.0 { if step < 1.0 { format!("{a:.1}s") } else { format!("{a:.0}s") } } else { format!("{}:{:02}", (a / 60.0) as i64, (a % 60.0) as i64) };
+            let label = if rel < -1e-6 { format!("−{label}") } else { label };
+            p.text(egui::pos2(x + 4.0, rect.top() + 2.0), Align2::LEFT_TOP, label, mono(T_META - 1.0), if rel < -1e-6 || t > self.s.end { TEXT_3.gamma_multiply(0.6) } else { TEXT_3 });
+        }
+        let px = self.tx(inner, self.player.pos);
+        p.add(egui::Shape::convex_polygon(vec![egui::pos2(px - 5.0, rect.bottom() - 7.0), egui::pos2(px + 5.0, rect.bottom() - 7.0), egui::pos2(px, rect.bottom())], TEXT, Stroke::NONE));
+        if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+            let t = self.t_of(inner, pos.x);
+            self.seek(t);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
     }
 
     /// Quadro da fonte com as áreas. Devolve true num clique simples (tocar/pausar).
@@ -796,9 +1115,6 @@ impl ClipModal {
         let defs = boxes(&self.layout_at(t), self.s.split);
         if defs.is_empty() {
             ui.painter().text(outer.center_bottom() - egui::vec2(0.0, 16.0), Align2::CENTER_BOTTOM, "Horizontal usa o vídeo inteiro", body(T_SEC), TEXT_2);
-        }
-        if self.cut_at(self.player.pos).is_some() {
-            ui.painter().text(outer.center_top() + egui::vec2(0.0, 12.0), Align2::CENTER_TOP, "Trecho cortado: não entra no clipe", body(T_SEC), ERR);
         }
         let p = ui.painter_at(outer);
         for b in &defs {
@@ -945,22 +1261,120 @@ impl ClipModal {
         resp.clicked()
     }
 
-    /// Prévia 9:16 do clipe como vai sair, com a legenda arrastável.
+    /// Prévia 9:16 do clipe como vai sair. Arrastar uma área encaixada muda
+    /// ela de lugar (roda do mouse muda o tamanho); arrastar a legenda muda a
+    /// legenda de lugar.
     fn preview(&mut self, ui: &mut Ui, width: f32, height: f32, fonts: &[String]) {
-        let (slot, resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::drag());
+        let (slot, resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click_and_drag());
         let t = self.now();
-        let tex = self.player.texture().map(|tx| (tx, self.player.aspect()));
+        let src = self.player.aspect();
+        let tex = self.player.texture().map(|tx| (tx, src));
         let st = self.style_now();
         let (layout, cam, scr) = self.look_at(t);
         let words = self.words_now();
         clip_preview(ui, slot, tex, &layout, cam, scr, self.s.fit, self.s.split, &self.s.bg, self.bg_tex.as_ref(), self.wm_items(), st.as_ref(), fonts, &words, t);
-        // Arrastar na prévia move a legenda (em cima, no meio ou embaixo + distância).
-        if let Some(base) = self.style.as_ref() {
-            let out = if self.s.layout == "horizontal" { Rect::from_center_size(slot.center(), egui::vec2(slot.width(), slot.width() * 9.0 / 16.0)) } else { slot };
-            if resp.hovered() {
+        let out = if self.s.layout == "horizontal" { Rect::from_center_size(slot.center(), egui::vec2(slot.width(), slot.width() * 9.0 / 16.0)) } else { slot };
+
+        // Áreas encaixadas: espaço e onde a área está dentro dele.
+        let movable: Vec<(Key, Rect, Rect)> = out_slots(out, &layout, self.s.split)
+            .into_iter()
+            .filter(|(k, _)| self.fit_of(*k))
+            .map(|(k, dst)| {
+                let r = if k == Key::Camera { cam } else { scr };
+                (k, dst, placed_rect(dst, area_aspect(r, src), self.place_of(k)))
+            })
+            .collect();
+        // Faixa onde a legenda está (para pegar ela antes da área).
+        let cap_band = self.style.as_ref().map(|base| {
+            let adj = self.cap_at(t).unwrap_or_else(|| CaptionAdjust::from_style(base));
+            let bh = (adj.size / 1920.0) as f32 * out.height() * 1.3;
+            let top = match adj.position.as_str() {
+                "top" => out.top() + out.height() * adj.margin as f32,
+                "center" => out.center().y - bh / 2.0,
+                _ => out.bottom() - out.height() * adj.margin as f32 - bh,
+            };
+            Rect::from_min_size(egui::pos2(out.left(), top), egui::vec2(out.width(), bh)).expand2(egui::vec2(0.0, 6.0))
+        });
+        let on_cap = |pos: Pos2| cap_band.is_some_and(|b| b.contains(pos));
+        let on_area = |pos: Pos2| movable.iter().rev().find(|m| m.2.contains(pos)).copied();
+
+        if let Some(pos) = resp.hover_pos() {
+            if self.place_drag.is_some() || (!self.cap_drag && !on_cap(pos) && on_area(pos).is_some()) {
+                ui.ctx().set_cursor_icon(if self.place_drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            } else if self.cap_drag || on_cap(pos) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
             }
-            if resp.drag_started() {
+        }
+        if resp.drag_started() {
+            if let Some(pos) = ui.input(|i| i.pointer.press_origin()) {
+                if on_cap(pos) {
+                    self.cap_drag = true;
+                } else if let Some((k, _, pr)) = on_area(pos) {
+                    self.place_drag = Some((k, pr, pos));
+                }
+            }
+        }
+        // Arraste da área: fração da sobra do espaço, com travas no começo, meio e fim.
+        if let (Some((k, r0, from)), Some(pos)) = (self.place_drag, resp.interact_pointer_pos()) {
+            if resp.dragged() {
+                if let Some(&(_, dst, _)) = movable.iter().find(|m| m.0 == k) {
+                    let snap = self.snap && !ui.input(|i| i.modifiers.alt);
+                    let min = r0.min + (pos - from);
+                    let mut p = self.place_of(k);
+                    let mut guides = (None, None);
+                    let axis = |off: f32, free: f32, cur: f64, lo: f32, size: f32, g: &mut Option<f32>| -> f64 {
+                        if free < 1.0 {
+                            return cur;
+                        }
+                        let mut f = (off / free).clamp(0.0, 1.0) as f64;
+                        if snap {
+                            for s in [0.0, 0.5, 1.0] {
+                                if (off - free * s as f32).abs() < SNAP_PX {
+                                    f = s;
+                                    *g = Some(lo + free * s as f32 + size * s as f32);
+                                }
+                            }
+                        }
+                        f
+                    };
+                    p.x = axis(min.x - dst.left(), dst.width() - r0.width(), p.x, dst.left(), r0.width(), &mut guides.0);
+                    p.y = axis(min.y - dst.top(), dst.height() - r0.height(), p.y, dst.top(), r0.height(), &mut guides.1);
+                    self.place_guides = guides;
+                    self.set_place(k, p);
+                }
+            }
+        }
+        if resp.drag_stopped() || !ui.input(|i| i.pointer.any_down()) {
+            self.place_drag = None;
+            self.place_guides = (None, None);
+        }
+        // Roda do mouse sobre uma área encaixada: tamanho.
+        if let Some(pos) = resp.hover_pos().filter(|p| !on_cap(*p)) {
+            let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+            if let (true, Some((k, _, _))) = (wheel != 0.0, on_area(pos)) {
+                let mut p = self.place_of(k);
+                p.scale = (p.scale * (wheel as f64 * 0.002).exp()).clamp(PLACE_SCALE_MIN, 1.0);
+                self.set_place(k, p);
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
+        }
+        // Contorno da área que dá para pegar e linhas das travas.
+        let pt = ui.painter_at(out);
+        let hot = self.place_drag.map(|d| d.0).or_else(|| resp.hover_pos().filter(|p| !on_cap(*p) && !self.cap_drag).and_then(on_area).map(|m| m.0));
+        if let Some(k) = hot {
+            if let Some(&(_, dst, pr)) = movable.iter().find(|m| m.0 == k) {
+                pt.rect_stroke(dst, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_white_alpha(40)), StrokeKind::Inside);
+                pt.rect_stroke(pr, CornerRadius::ZERO, Stroke::new(1.5, ACCENT_INK), StrokeKind::Inside);
+                if let Some(x) = self.place_guides.0 {
+                    pt.vline(x, dst.y_range(), Stroke::new(1.0, MARK));
+                }
+                if let Some(y) = self.place_guides.1 {
+                    pt.hline(dst.x_range(), y, Stroke::new(1.0, MARK));
+                }
+            }
+        }
+        if let Some(base) = self.style.as_ref() {
+            if resp.drag_started() && self.place_drag.is_none() && !self.cap_drag && movable.is_empty() {
                 self.cap_drag = true;
             }
             if let (true, Some(pos)) = (self.cap_drag && resp.dragged(), resp.interact_pointer_pos()) {
@@ -978,7 +1392,17 @@ impl ClipModal {
             if resp.drag_stopped() {
                 self.cap_drag = false;
             }
-            resp.on_hover_text("Arraste para mudar a legenda de lugar");
+        }
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.cap_drag = false;
+        }
+        let tip = match resp.hover_pos() {
+            Some(p) if on_cap(p) => Some("Arraste para mudar a legenda de lugar"),
+            Some(p) if on_area(p).is_some() => Some("Arraste para mudar a área de lugar. Roda do mouse muda o tamanho"),
+            _ => None,
+        };
+        if let Some(tip) = tip {
+            resp.on_hover_text(tip);
         }
     }
 
@@ -1101,7 +1525,7 @@ impl ClipModal {
             let b = parts.get(i + 1).map(|p| p.0).unwrap_or(len);
             let on = cur >= *a && cur < b;
             let r = Rect::from_min_max(egui::pos2(self.tx(inner, self.s.start + a) + 1.0, inner.top()), egui::pos2(self.tx(inner, self.s.start + b) - 1.0, inner.bottom()));
-            let fill = if on { Color32::from_rgba_unmultiplied(214, 160, 59, 80) } else if i % 2 == 0 { RAISED } else { RAISED_2 };
+            let fill = if on { Color32::from_rgba_unmultiplied(59, 99, 214, 70) } else if i % 2 == 0 { RAISED } else { RAISED_2 };
             p.rect_filled(r, CornerRadius::same(3), fill);
             let pos = match adj.as_ref().map(|a| a.position.as_str()) {
                 Some("top") => " · em cima",
@@ -1121,89 +1545,90 @@ impl ClipModal {
         }
     }
 
-    fn areas_panel(&mut self, ui: &mut Ui) {
-        w::label(ui, "Áreas");
+    /// Escolha da composição do trecho: três quadrinhos 9:16 desenhados.
+    fn layout_tiles(&mut self, ui: &mut Ui, t: f64) {
+        let cur = Vertical::from_id(&self.layout_at(t)).unwrap_or(Vertical::Camera);
+        let opts = [(Vertical::Camera, "Câmera"), (Vertical::Split, "Tela em cima"), (Vertical::SplitCam, "Câmera em cima")];
+        let tw = (SIDE_W - 16.0) / 3.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for (v, name) in opts {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(tw, 84.0), Sense::click());
+                let on = cur == v;
+                let p = ui.painter();
+                p.rect(r, CornerRadius::same(R), if on { RAISED_2 } else if resp.hovered() { RAISED } else { BG_DEEP }, Stroke::new(1.0, if on { ACCENT } else { LINE }), StrokeKind::Inside);
+                let fr = Rect::from_center_size(r.center_top() + egui::vec2(0.0, 32.0), egui::vec2(27.0, 48.0));
+                p.rect_stroke(fr, CornerRadius::same(3), Stroke::new(1.0, if on { TEXT_2 } else { TEXT_3 }), StrokeKind::Inside);
+                let cam_c = if on { ACCENT } else { TEXT_3.gamma_multiply(0.5) };
+                let scr_c = if on { TEXT_2.gamma_multiply(0.5) } else { TEXT_3.gamma_multiply(0.25) };
+                let split = self.s.split.clamp(0.2, 0.8) as f32;
+                let inner = fr.shrink(3.0);
+                match v {
+                    Vertical::Camera => {
+                        p.rect_filled(inner, CornerRadius::same(1), cam_c);
+                    }
+                    Vertical::Split => {
+                        let y = inner.top() + inner.height() * split;
+                        p.rect_filled(Rect::from_min_max(inner.min, egui::pos2(inner.right(), y - 1.0)), CornerRadius::same(1), scr_c);
+                        p.rect_filled(Rect::from_min_max(egui::pos2(inner.left(), y + 1.0), inner.max), CornerRadius::same(1), cam_c);
+                    }
+                    _ => {
+                        let y = inner.top() + inner.height() * (1.0 - split);
+                        p.rect_filled(Rect::from_min_max(inner.min, egui::pos2(inner.right(), y - 1.0)), CornerRadius::same(1), cam_c);
+                        p.rect_filled(Rect::from_min_max(egui::pos2(inner.left(), y + 1.0), inner.max), CornerRadius::same(1), scr_c);
+                    }
+                }
+                p.text(r.center_bottom() - egui::vec2(0.0, 12.0), Align2::CENTER_CENTER, name, body(T_META), if on { TEXT } else { TEXT_2 });
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on {
+                    self.set_layout_at(t, v);
+                }
+            }
+        });
+    }
+
+    /// Enquadrar: composição, divisão e, para cada área, preencher/encaixar,
+    /// zoom, posição no espaço e fundo.
+    fn frame_panel(&mut self, ui: &mut Ui) {
         let t = self.now();
         if self.s.layout == "horizontal" {
-            ui.label(w::muted("No horizontal o clipe usa o vídeo inteiro, sem áreas. Troque o layout na lista de sugestões para usar áreas"));
+            ui.add(egui::Label::new(w::muted("No horizontal o clipe usa o vídeo inteiro, sem áreas. Troque o layout na lista de sugestões para usar áreas")).wrap());
             return;
         }
-        // Modo de recorte do trecho onde a agulha está.
-        ui.label(w::dim("Modo deste trecho"));
-        ui.add_space(4.0);
-        let mut v = Vertical::from_id(&self.layout_at(t)).unwrap_or(Vertical::Camera);
-        if w::seg(ui, &mut v, &[(Vertical::Camera, "Só câmera"), (Vertical::Split, "Tela em cima"), (Vertical::SplitCam, "Câmera em cima")]) {
-            self.set_layout_at(t, v);
-        }
+        group(ui, "Composição deste trecho");
+        self.layout_tiles(ui, t);
         let lay = self.layout_at(t);
         if lay != "vertical_camera" {
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.label(w::dim("Divisão"));
                 let mut tela = self.s.split * 100.0;
+                ui.spacing_mut().slider_width = 120.0;
                 if ui.add(egui::Slider::new(&mut tela, 20.0..=80.0).step_by(5.0).show_value(false)).on_hover_text("Quanto da altura fica para a tela (vale para o clipe todo)").changed() {
                     self.s.split = tela / 100.0;
                 }
-                ui.label(w::mono_text(format!("tela {:.0}% · câmera {:.0}%", tela, 100.0 - tela), T_META, TEXT_3));
+                ui.label(w::mono_text(format!("{:.0} / {:.0}", tela, 100.0 - tela), T_META, TEXT_3));
             });
         }
-        ui.add_space(10.0);
         let defs = boxes(&lay, self.s.split);
-        let act = self.active(t);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if w::button(ui, Kind::Default, Some(ic::PLUS), "Nova troca").on_hover_text("A partir deste instante o clipe usa outra área (N). Pause onde a câmera mudou de lugar").clicked() {
-                self.new_area_key(t);
-            }
-            ui.add_enabled_ui(act.is_some(), |ui| {
-                if w::button(ui, Kind::Ghost, Some(ic::TRASH_2), "Remover troca").on_hover_text("Este trecho volta a usar a área anterior (Del)").clicked() {
-                    if let Some(i) = act {
-                        self.s.keys.remove(i);
-                    }
-                }
-            });
-        });
-        ui.add_space(4.0);
-        let n = area_segments(self.s.start, self.s.end, &self.s.layout, self.s.camera, self.s.screen, &self.s.keys).len();
-        ui.label(w::muted(if n > 1 { format!("{n} áreas neste clipe. Arraste a área do trecho onde a agulha está") } else { "Uma área para o clipe todo. Arraste as alças para dar o formato que quiser".to_string() }));
-        if n > 1 {
-            ui.add_space(6.0);
-            ui.label(w::dim("Nas trocas"));
-            ui.add_space(4.0);
-            w::seg(ui, &mut self.s.smooth, &[(false, "Corte seco"), (true, "Deslizar")]);
-            if self.s.smooth {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(w::dim("Duração"));
-                    ui.add(egui::Slider::new(&mut self.s.smooth_secs, SMOOTH_MIN..=SMOOTH_MAX).step_by(0.1).show_value(false))
-                        .on_hover_text("Quanto tempo a área leva para deslizar de uma posição para a outra");
-                    ui.label(w::mono_text(format!("{:.1} s", self.s.smooth_secs), T_META, TEXT_3));
-                });
-                ui.add_space(8.0);
-                self.curve_editor(ui);
-            }
-        }
-        ui.add_space(10.0);
-        ui.label(w::dim("Travas no centro"));
-        ui.add_space(4.0);
-        w::seg(ui, &mut self.snap, &[(true, "Ligadas"), (false, "Desligadas")]);
-        ui.add_space(2.0);
-        ui.label(w::muted("A área gruda no meio do quadro ao mover ou esticar. Segure Alt para soltar na hora (T liga/desliga)"));
-        ui.add_space(10.0);
         for b in &defs {
-            ui.label(w::dim(b.label));
-            ui.add_space(4.0);
+            gap(ui);
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 16.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.5, b.color);
+                ui.label(egui::RichText::new(b.label).font(strong(T_SEC)).color(TEXT));
+            });
+            ui.add_space(8.0);
             let mut v = self.fit_of(b.key);
             if w::seg(ui, &mut v, &[(false, "Preencher"), (true, "Encaixar")]) {
                 if b.key == Key::Camera { self.s.fit.camera = v } else { self.s.fit.screen = v }
             }
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                if w::button(ui, Kind::Default, None, "−").on_hover_text("Afastar (mostra mais do quadro)").clicked() {
+                if w::button(ui, Kind::Default, None, "−").on_hover_text("Afastar: mostra mais do quadro").clicked() {
                     self.zoom(b.key, t, 1.0 / 0.9);
                 }
-                if w::button(ui, Kind::Default, None, "+").on_hover_text("Aproximar (recorta mais perto)").clicked() {
+                if w::button(ui, Kind::Default, None, "+").on_hover_text("Aproximar: recorta mais perto").clicked() {
                     self.zoom(b.key, t, 0.9);
                 }
                 ui.add_space(4.0);
@@ -1214,20 +1639,121 @@ impl ClipModal {
                     self.set(b.key, t, FRect::FULL);
                 }
             });
-            ui.add_space(12.0);
+            if self.fit_of(b.key) {
+                ui.add_space(12.0);
+                let mut p = self.place_of(b.key);
+                let mut ch = false;
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 16.0;
+                    ch |= anchor_pad(ui, &mut p);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.label(w::dim("Posição no espaço"));
+                        ui.horizontal(|ui| {
+                            ui.label(w::dim("Tamanho"));
+                            let mut pct = p.scale * 100.0;
+                            ui.spacing_mut().slider_width = 80.0;
+                            if ui.add(egui::Slider::new(&mut pct, PLACE_SCALE_MIN * 100.0..=100.0).step_by(1.0).show_value(false)).changed() {
+                                p.scale = pct / 100.0;
+                                ch = true;
+                            }
+                            ui.label(w::mono_text(format!("{:.0}%", pct), T_META, TEXT_3));
+                        });
+                        let moved = !p.is_center();
+                        ui.add_enabled_ui(moved, |ui| {
+                            if w::button(ui, Kind::Ghost, Some(ic::ROTATE_CCW), "Centralizar").clicked() {
+                                p = Place::CENTER;
+                                ch = true;
+                            }
+                        });
+                    });
+                });
+                if ch {
+                    self.set_place(b.key, p);
+                }
+            }
         }
-        self.bg_picker(ui, defs.iter().any(|b| self.fit_of(b.key)));
+        if defs.iter().any(|b| self.fit_of(b.key)) {
+            gap(ui);
+            self.bg_picker(ui, true);
+            ui.add(egui::Label::new(w::muted("Na saída, arraste a área encaixada para mudar de lugar e use a roda do mouse para o tamanho")).wrap());
+        } else {
+            ui.add_space(12.0);
+            ui.add(egui::Label::new(w::muted("Encaixar mostra a área inteira no espaço, com o fundo que você escolher na sobra, e deixa mudar a posição dela")).wrap());
+        }
+    }
+
+    /// Trocas de área ao longo do clipe e como passam de uma para outra.
+    fn motion_panel(&mut self, ui: &mut Ui) {
+        let t = self.now();
+        if self.s.layout == "horizontal" {
+            ui.add(egui::Label::new(w::muted("No horizontal o clipe usa o vídeo inteiro, sem trocas de área")).wrap());
+            return;
+        }
+        let act = self.active(t);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if w::button(ui, Kind::Default, Some(ic::PLUS), "Nova troca aqui").on_hover_text("A partir deste instante o clipe usa outra área (N). Pause onde a câmera mudou de lugar").clicked() {
+                self.new_area_key(t);
+            }
+            ui.add_enabled_ui(act.is_some(), |ui| {
+                if w::button(ui, Kind::Ghost, Some(ic::TRASH_2), "Remover").on_hover_text("Este trecho volta a usar a área anterior (Del)").clicked() {
+                    if let Some(i) = act {
+                        self.s.keys.remove(i);
+                    }
+                }
+            });
+        });
         ui.add_space(8.0);
-        ui.label(w::muted("Encaixar mostra a área inteira e completa a sobra com o fundo escolhido. Roda do mouse sobre uma área também dá zoom"));
+        let n = area_segments(self.s.start, self.s.end, &self.s.layout, self.s.camera, self.s.screen, &self.s.keys).len();
+        ui.add(egui::Label::new(w::muted(if n > 1 {
+            format!("{n} áreas neste clipe. As mudanças no Enquadrar valem no trecho onde a agulha está")
+        } else {
+            "Uma área para o clipe todo. Pause onde a câmera mudou de lugar e crie uma troca".to_string()
+        }))
+        .wrap());
+        gap(ui);
+        group(ui, "Passagem entre áreas");
+        ui.add_enabled_ui(n > 1, |ui| {
+            w::seg(ui, &mut self.s.smooth, &[(false, "Corte seco"), (true, "Deslizar")]);
+        });
+        if n > 1 && self.s.smooth {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(w::dim("Duração"));
+                ui.spacing_mut().slider_width = 140.0;
+                ui.add(egui::Slider::new(&mut self.s.smooth_secs, SMOOTH_MIN..=SMOOTH_MAX).step_by(0.1).show_value(false))
+                    .on_hover_text("Quanto tempo a área leva para deslizar de uma posição para a outra");
+                ui.label(w::mono_text(format!("{:.1} s", self.s.smooth_secs), T_META, TEXT_3));
+            });
+            gap(ui);
+            self.curve_editor(ui);
+        } else if n <= 1 {
+            ui.add_space(4.0);
+            ui.label(w::muted("Disponível com duas áreas ou mais"));
+        }
+    }
+
+    /// Marca d'água do clipe.
+    fn mark_panel(&mut self, ui: &mut Ui) {
+        self.watermark_panel(ui);
+        ui.add_space(12.0);
+        ui.add(egui::Label::new(w::muted("Crie, posicione e mude a transparência dos textos em Modelos › Marcas d'água")).wrap());
     }
 
     /// Fundo atrás das áreas em Encaixar: vídeo desfocado, desfoque leve,
     /// nada (preto) ou um arquivo da biblioteca de fundos de clipe.
     fn bg_picker(&mut self, ui: &mut Ui, any_fit: bool) {
-        ui.label(w::dim("Fundo do Encaixar"));
-        ui.add_space(4.0);
+        group(ui, "Fundo da sobra");
         let mut mode = self.s.bg.mode();
-        if w::seg(ui, &mut mode, &ClipBg::MODES) {
+        // Dois por linha: as quatro opções não cabem lado a lado no painel.
+        let half = (ClipBg::MODES.len() + 1) / 2;
+        let mut pick = false;
+        for row in ClipBg::MODES.chunks(half) {
+            pick |= w::seg(ui, &mut mode, row);
+            ui.add_space(4.0);
+        }
+        if pick {
             self.s.bg = match mode {
                 "file" => {
                     // Volta ao último arquivo usado, ou ao primeiro da biblioteca.
@@ -1244,7 +1770,7 @@ impl ClipModal {
             } else {
                 let name = self.backgrounds.iter().find(|b| &b.file_path == cur).map(|b| b.name.clone()).unwrap_or_else(|| "Escolher fundo".into());
                 let mut pick = None;
-                egui::ComboBox::from_id_salt("clip-modal-bg").width(SIDE_W - 24.0).selected_text(name).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("clip-modal-bg").width(SIDE_W).selected_text(name).show_ui(ui, |ui| {
                     for b in &self.backgrounds {
                         if ui.selectable_label(&b.file_path == cur, &b.name).clicked() {
                             pick = Some(b.file_path.clone());
@@ -1267,7 +1793,7 @@ impl ClipModal {
     /// percorrido no y. Dois pontos de controle arrastáveis, curvas prontas,
     /// valores exatos e uma bolinha que mostra o movimento.
     fn curve_editor(&mut self, ui: &mut Ui) {
-        ui.label(w::dim("Curva do movimento"));
+        group(ui, "Curva do movimento");
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
@@ -1281,7 +1807,7 @@ impl ClipModal {
         });
         ui.add_space(6.0);
         let shown = self.s.curve.unwrap_or(SOFT_LIKE);
-        let w_ = ui.available_width().min(SIDE_W - 24.0);
+        let w_ = SIDE_W;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w_, 190.0), Sense::click_and_drag());
         let p = ui.painter_at(rect);
         p.rect(rect, CornerRadius::same(R), BG_DEEP, Stroke::new(1.0, LINE), StrokeKind::Inside);
@@ -1473,15 +1999,44 @@ impl ClipModal {
     }
 
     fn caption_panel(&mut self, ui: &mut Ui) {
-        w::label(ui, "Marca d'água");
-        self.watermark_panel(ui);
-        ui.add_space(14.0);
-        w::label(ui, "Legenda deste clipe");
         let Some(base) = self.style.clone() else {
-            ui.label(w::muted("Escolha um modelo de legenda na tela de Clipes para ajustar aqui"));
+            ui.add(egui::Label::new(w::muted("Escolha um modelo de legenda na tela de Clipes para ajustar aqui")).wrap());
             return;
         };
         let t = self.now();
+        let cur = self.cap_at(t);
+        let mut adj = cur.clone().unwrap_or_else(|| CaptionAdjust::from_style(&base));
+        let mut ch = false;
+        group(ui, "Posição");
+        ch |= w::seg(ui, &mut adj.position, &[("top".to_string(), "Em cima"), ("center".to_string(), "Meio"), ("bottom".to_string(), "Embaixo")]);
+        ui.add_space(12.0);
+        let row = |ui: &mut Ui, name: &str, slider: egui::Slider, value: String, enabled: bool| -> bool {
+            let mut c = false;
+            ui.horizontal(|ui| {
+                ui.add_sized(egui::vec2(64.0, 20.0), egui::Label::new(w::dim(name)));
+                ui.spacing_mut().slider_width = SIDE_W - 64.0 - 56.0;
+                ui.add_enabled_ui(enabled, |ui| c = ui.add(slider.show_value(false)).changed());
+                ui.label(w::mono_text(value, T_META, TEXT_3));
+            });
+            c
+        };
+        let (m, s) = (adj.margin * 100.0, adj.size / base.size.max(1.0) * 100.0);
+        let center = adj.position == "center";
+        ch |= row(ui, "Distância", egui::Slider::new(&mut adj.margin, 0.0..=0.45).step_by(0.01), format!("{m:.0}%"), !center);
+        ui.add_space(4.0);
+        ch |= row(ui, "Tamanho", egui::Slider::new(&mut adj.size, 24.0..=240.0).step_by(2.0), format!("{s:.0}%"), true);
+        if ch {
+            self.set_cap(t, Some(adj));
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(w::muted("Ou arraste a legenda na saída"));
+            if cur.is_some_and(|c| c != CaptionAdjust::from_style(&base)) && w::button(ui, Kind::Ghost, Some(ic::ROTATE_CCW), "Usar a do modelo").clicked() {
+                self.set_cap(t, None);
+            }
+        });
+        gap(ui);
+        group(ui, "Trocas de legenda");
         let act = self.cap_active(t);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -1494,65 +2049,32 @@ impl ClipModal {
                 }
             }
             ui.add_enabled_ui(act.is_some(), |ui| {
-                if w::button(ui, Kind::Ghost, Some(ic::TRASH_2), "Remover troca").on_hover_text("Este trecho volta a usar a legenda anterior").clicked() {
+                if w::button(ui, Kind::Ghost, Some(ic::TRASH_2), "Remover").on_hover_text("Este trecho volta a usar a legenda anterior").clicked() {
                     if let Some(i) = act {
                         self.s.cap_keys.remove(i);
                     }
                 }
             });
         });
-        ui.add_space(4.0);
-        let n = caption_parts(self.s.start, self.s.end, self.s.caption.clone(), &self.s.cap_keys).len();
-        ui.label(w::muted(if n > 1 { format!("{n} trechos de legenda. Os ajustes valem no trecho onde a agulha está") } else { "A mesma legenda no clipe todo".to_string() }));
         ui.add_space(8.0);
-        let cur = self.cap_at(t);
-        let mut adj = cur.clone().unwrap_or_else(|| CaptionAdjust::from_style(&base));
-        let mut ch = false;
-        ui.horizontal(|ui| {
-            ui.add_sized(egui::vec2(70.0, 20.0), egui::Label::new(w::dim("Posição")));
-            ch |= w::seg(ui, &mut adj.position, &[("top".to_string(), "Em cima"), ("center".to_string(), "Meio"), ("bottom".to_string(), "Embaixo")]);
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_sized(egui::vec2(70.0, 20.0), egui::Label::new(w::dim("Distância")));
-            ui.add_enabled_ui(adj.position != "center", |ui| {
-                ch |= ui.add(egui::Slider::new(&mut adj.margin, 0.0..=0.45).step_by(0.01).show_value(false)).changed();
-            });
-            ui.label(w::mono_text(format!("{:.0}%", adj.margin * 100.0), T_META, TEXT_3));
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_sized(egui::vec2(70.0, 20.0), egui::Label::new(w::dim("Tamanho")));
-            ch |= ui.add(egui::Slider::new(&mut adj.size, 24.0..=240.0).step_by(2.0).show_value(false)).changed();
-            ui.label(w::mono_text(format!("{:.0}%", adj.size / base.size.max(1.0) * 100.0), T_META, TEXT_3));
-        });
-        if ch {
-            self.set_cap(t, Some(adj));
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(w::muted("Ou arraste a legenda na prévia"));
-            if cur.is_some_and(|c| c != CaptionAdjust::from_style(&base)) && w::button(ui, Kind::Ghost, Some(ic::ROTATE_CCW), "Usar a do modelo").clicked() {
-                self.set_cap(t, None);
-            }
-        });
+        let n = caption_parts(self.s.start, self.s.end, self.s.caption.clone(), &self.s.cap_keys).len();
+        ui.add(egui::Label::new(w::muted(if n > 1 { format!("{n} trechos de legenda. Os ajustes valem no trecho onde a agulha está") } else { "A mesma legenda no clipe todo".to_string() })).wrap());
     }
 
     /// Palavras do clipe para corrigir o que a transcrição errou.
-    fn text_panel(&mut self, ui: &mut Ui) {
-        w::label(ui, "Texto da legenda");
+    fn text_panel(&mut self, ui: &mut Ui, max_h: f32) {
         if self.words.is_empty() {
             ui.label(w::muted("Sem transcrição para este vídeo"));
             return;
         }
-        ui.label(w::muted("Clique numa palavra para corrigir ou apagar. Vale só neste clipe"));
-        ui.add_space(6.0);
+        ui.add(egui::Label::new(w::muted("Clique numa palavra. Vale só neste clipe")).wrap());
+        ui.add_space(8.0);
         let (a, b) = (self.s.start, self.s.end);
         let list: Vec<(f64, String, Option<String>)> =
             self.words.iter().filter(|w| w.end > a && w.start < b).map(|w| (w.start, w.text.clone(), self.edit_of(w.start).map(str::to_string))).collect();
         let pos = self.player.pos;
         let mut pick: Option<(f64, String)> = None;
-        egui::ScrollArea::vertical().id_salt("clip-modal-words").max_height(130.0).auto_shrink([false, true]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("clip-modal-words").max_height((max_h - 120.0).max(160.0)).auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                 for (t, orig, edit) in &list {
@@ -1628,9 +2150,8 @@ pub fn clip_preview(
     ui.painter().rect_filled(slot, CornerRadius::same(R), BG_DEEP);
     ui.painter().rect_filled(out, CornerRadius::same(R), Color32::BLACK);
     let pt = ui.painter_at(out);
-    let split = split.clamp(0.2, 0.8) as f32;
     if let Some((tex, aspect)) = tex {
-        let place = |dst: Rect, r: FRect, fit: bool| {
+        let place = |dst: Rect, r: FRect, fit: bool, at: Place| {
             let pt = ui.painter_at(dst);
             let v = visible(r, aspect, dst.width() / dst.height());
             let uv = |r: FRect| Rect::from_min_size(egui::pos2(r.x as f32, r.y as f32), egui::vec2(r.w as f32, r.h as f32));
@@ -1648,27 +2169,19 @@ pub fn clip_preview(
                         pt.rect_filled(dst, CornerRadius::ZERO, Color32::BLACK);
                     }
                 }
-                let a = (r.w as f32 * aspect) / (r.h as f32).max(0.0001);
-                pt.image(tex.id(), fit_rect(dst, a), uv(r), Color32::WHITE);
+                pt.image(tex.id(), placed_rect(dst, area_aspect(r, aspect), at), uv(r), Color32::WHITE);
             } else {
                 pt.image(tex.id(), dst, uv(v), Color32::WHITE);
             }
         };
-        match layout {
-            "horizontal" => {
-                pt.image(tex.id(), fit_rect(out, aspect), Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        if layout == "horizontal" {
+            pt.image(tex.id(), fit_rect(out, aspect), Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        for (k, dst) in out_slots(out, layout, split) {
+            match k {
+                Key::Camera => place(dst, cam, fit.camera, fit.cam_place),
+                Key::Screen => place(dst, scr, fit.screen, fit.scr_place),
             }
-            "vertical_split" => {
-                let y = out.top() + out.height() * split;
-                place(Rect::from_min_max(out.min, egui::pos2(out.right(), y)), scr, fit.screen);
-                place(Rect::from_min_max(egui::pos2(out.left(), y), out.max), cam, fit.camera);
-            }
-            "vertical_split_cam" => {
-                let y = out.top() + out.height() * (1.0 - split);
-                place(Rect::from_min_max(out.min, egui::pos2(out.right(), y)), cam, fit.camera);
-                place(Rect::from_min_max(egui::pos2(out.left(), y), out.max), scr, fit.screen);
-            }
-            _ => place(out, cam, fit.camera),
         }
     }
     if let Some(items) = wm {
