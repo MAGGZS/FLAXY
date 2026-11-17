@@ -65,7 +65,9 @@ try {
 }
 
 if (-not $SkipBuild) {
-    cmd /c build-installer.bat
+    # Caminho completo: Set-Location não muda a pasta que o cmd herda.
+    [Environment]::CurrentDirectory = $root
+    cmd /c "`"$(Join-Path $root 'build-installer.bat')`""
     if ($LASTEXITCODE -ne 0) { Write-Host "Falha no build." -ForegroundColor Red; exit 1 }
 }
 

@@ -146,6 +146,44 @@ impl Config {
                     ui.label(RichText::new("1 é o ideal na maioria das máquinas: dois encoders disputando a mesma GPU terminam mais devagar que em fila").font(body(T_META)).color(TEXT_3));
                 });
             });
+            // Cookies do YouTube: o yt-dlp usa quando o YouTube pede login.
+            let mut yt_changed = false;
+            w::card(ui, "YouTube", "valem já no próximo download", |_| {}, |ui| {
+                w::pad(ui, |ui| {
+                    w::label(ui, "Cookies do navegador");
+                    let browsers = [("", "Nenhum"), ("firefox", "Firefox"), ("edge", "Edge"), ("chrome", "Chrome"), ("brave", "Brave"), ("opera", "Opera")];
+                    let cur = browsers.iter().find(|b| b.0 == f.yt_cookies_browser).map(|b| b.1).unwrap_or("Nenhum");
+                    egui::ComboBox::from_id_salt("yt-cookies-browser").width(220.0).selected_text(cur).show_ui(ui, |ui| {
+                        for (id, name) in browsers {
+                            if ui.selectable_label(f.yt_cookies_browser == id, name).clicked() {
+                                f.yt_cookies_browser = id.to_string();
+                                yt_changed = true;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new("Quando o YouTube pede \"confirme que não é um robô\", o download usa o login do navegador escolhido. Fique logado no YouTube nele. Firefox funciona melhor: o Chrome e o Edge protegem os cookies e às vezes precisam estar fechados").font(body(T_META)).color(TEXT_3)).wrap());
+                    ui.add_space(12.0);
+                    w::label(ui, "Ou arquivo cookies.txt (vale mais que o navegador)");
+                    ui.horizontal(|ui| {
+                        yt_changed |= ui.add(egui::TextEdit::singleline(&mut f.yt_cookies_file).desired_width(420.0).font(mono(T_SEC)).hint_text("nenhum")).changed();
+                        if w::button(ui, Kind::Default, Some(ic::FOLDER), "Escolher").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().set_title("Arquivo cookies.txt").add_filter("Cookies", &["txt"]).pick_file() {
+                                f.yt_cookies_file = p.display().to_string();
+                                yt_changed = true;
+                            }
+                        }
+                        if !f.yt_cookies_file.is_empty() && w::icon_button(ui, ic::X, "Tirar arquivo").clicked() {
+                            f.yt_cookies_file.clear();
+                            yt_changed = true;
+                        }
+                    });
+                });
+            });
+            if yt_changed {
+                f.apply_yt_cookies();
+                changed = true;
+            }
             self.dirty |= changed;
         });
 

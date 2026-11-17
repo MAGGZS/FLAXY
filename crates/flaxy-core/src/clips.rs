@@ -945,6 +945,73 @@ fn parse_rect(s: &Option<String>, fallback: Rect) -> Rect {
 
 static YTDLP: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Cookies do YouTube para o yt-dlp: navegador logado ou arquivo cookies.txt.
+/// O YouTube pede login ("confirme que não é um robô") em alguns downloads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct YtCookies {
+    /// "firefox", "edge", "chrome", "brave"... (vazio = nenhum).
+    pub browser: String,
+    /// Caminho de um cookies.txt exportado (vale mais que o navegador).
+    pub file: String,
+}
+
+static YT_COOKIES: std::sync::RwLock<Option<YtCookies>> = std::sync::RwLock::new(None);
+static JS_RUNTIME: OnceLock<Option<String>> = OnceLock::new();
+
+/// Troca os cookies usados nos próximos downloads.
+pub fn set_yt_cookies(c: YtCookies) {
+    if let Ok(mut g) = YT_COOKIES.write() {
+        *g = Some(c);
+    }
+}
+
+/// Runtime de JavaScript que o yt-dlp precisa para o YouTube: deno (padrão
+/// dele) ou, se não houver, o Node instalado no PATH.
+fn js_runtime() -> Option<&'static str> {
+    JS_RUNTIME
+        .get_or_init(|| {
+            let path = std::env::var_os("PATH")?;
+            let find = |exe: &str| std::env::split_paths(&path).map(|d| d.join(exe)).find(|p| p.is_file());
+            let ext = if cfg!(windows) { ".exe" } else { "" };
+            if let Some(d) = find(&format!("deno{ext}")) {
+                return Some(format!("deno:{}", d.display()));
+            }
+            find(&format!("node{ext}")).map(|n| format!("node:{}", n.display()))
+        })
+        .as_deref()
+}
+
+/// Opções comuns a toda chamada do yt-dlp: runtime de JS e cookies.
+pub fn ytdlp_args() -> Vec<String> {
+    let mut a = Vec::new();
+    if let Some(js) = js_runtime() {
+        a.push("--js-runtimes".into());
+        a.push(js.into());
+    }
+    let c = YT_COOKIES.read().ok().and_then(|g| g.clone()).unwrap_or_default();
+    if !c.file.trim().is_empty() && Path::new(c.file.trim()).is_file() {
+        a.push("--cookies".into());
+        a.push(c.file.trim().into());
+    } else if !c.browser.trim().is_empty() {
+        a.push("--cookies-from-browser".into());
+        a.push(c.browser.trim().into());
+    }
+    a
+}
+
+/// Mensagem do yt-dlp traduzida quando é algo que o usuário resolve.
+pub fn ytdlp_hint(err: &str) -> Option<&'static str> {
+    if err.contains("Sign in to confirm") || err.contains("not a bot") {
+        Some("O YouTube pediu login para baixar (verificação anti-robô). Em Configurações › YouTube, escolha o navegador em que você está logado no YouTube (Firefox funciona melhor) ou um arquivo cookies.txt, e tente de novo.")
+    } else if err.contains("Could not copy") && err.contains("cookie") {
+        Some("Não deu para ler os cookies do navegador: feche o navegador escolhido em Configurações › YouTube e tente de novo, ou use Firefox ou um arquivo cookies.txt.")
+    } else if err.contains("Failed to decrypt") {
+        Some("O Chrome protege os cookies e o yt-dlp não consegue ler. Em Configurações › YouTube, use Firefox ou um arquivo cookies.txt.")
+    } else {
+        None
+    }
+}
+
 /// yt-dlp em FLAXY_YTDLP_DIR (empacotado) ou no PATH.
 pub fn ytdlp() -> Option<&'static Path> {
     YTDLP
@@ -1400,6 +1467,7 @@ impl Clips {
         let dir = self.cfg.uploads_dir();
         let template = dir.join(format!("clip_src_{id}.%(ext)s"));
         let mut cmd = crate::media::command(bin);
+        cmd.args(ytdlp_args());
         cmd.args([
             "--no-playlist", "--newline", "--encoding", "utf-8", "--no-part", "--no-mtime",
             "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
@@ -1462,7 +1530,10 @@ impl Clips {
         let err = err_task.await.unwrap_or_default();
         match file {
             Some(f) if status.success() => Ok(PathBuf::from(f)),
-            _ => Err(Error::Invalid(format!("Falha no download: {err}"))),
+            _ => Err(Error::Invalid(match ytdlp_hint(&err) {
+                Some(h) => h.to_string(),
+                None => format!("Falha no download: {err}"),
+            })),
         }
     }
 

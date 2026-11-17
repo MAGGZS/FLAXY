@@ -34,6 +34,17 @@ pub type Res<T> = Result<T, String>;
 pub struct AppSettings {
     pub output_dir: String,
     pub max_concurrent: usize,
+    /// Navegador de onde o yt-dlp lê os cookies do YouTube (vazio = nenhum).
+    pub yt_cookies_browser: String,
+    /// Arquivo cookies.txt exportado (vale mais que o navegador).
+    pub yt_cookies_file: String,
+}
+
+impl AppSettings {
+    /// Passa os cookies do YouTube para o yt-dlp (vale já no próximo download).
+    pub fn apply_yt_cookies(&self) {
+        flaxy_core::clips::set_yt_cookies(flaxy_core::clips::YtCookies { browser: self.yt_cookies_browser.clone(), file: self.yt_cookies_file.clone() });
+    }
 }
 
 #[derive(Default)]
@@ -82,6 +93,7 @@ impl Backend {
         std::fs::create_dir_all(&cfg.storage_dir).context("criando pasta de dados")?;
         let pool = db::connect(&cfg.db_path()).await.context("abrindo banco")?;
         let settings = load_settings(&pool).await;
+        settings.apply_yt_cookies();
         if !settings.output_dir.trim().is_empty() {
             cfg.output_override = Some(PathBuf::from(settings.output_dir.trim()));
         }

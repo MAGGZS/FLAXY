@@ -758,6 +758,7 @@ async fn ytdlp(q: &str, sp: &str, hl: &str) -> Result<Vec<Video>, String> {
     let url = format!("https://www.youtube.com/results?search_query={}&sp={}", enc(q), enc(sp));
     let lang = format!("youtube:lang={hl}");
     let run = flaxy_core::media::command(bin)
+        .args(flaxy_core::clips::ytdlp_args())
         .args(["--flat-playlist", "-J", "--no-warnings", "--encoding", "utf-8", "--playlist-end", "40", "--extractor-args", &lang, "--"])
         .arg(&url)
         .kill_on_drop(true)
@@ -768,6 +769,9 @@ async fn ytdlp(q: &str, sp: &str, hl: &str) -> Result<Vec<Video>, String> {
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
+        if let Some(h) = flaxy_core::clips::ytdlp_hint(&err) {
+            return Err(h.to_string());
+        }
         let line = err.lines().rev().find(|l| l.contains("ERROR")).unwrap_or("falha no yt-dlp");
         return Err(line.trim_start_matches("ERROR:").trim().to_string());
     }
